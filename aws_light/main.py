@@ -168,6 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     metrics_collector = MetricsCollector(
         docker_client=docker_client,
         service_store=_service_store,
+        proxy_server=_proxy_server,
     )
     _autoscaler = Autoscaler(
         service_store=_service_store,

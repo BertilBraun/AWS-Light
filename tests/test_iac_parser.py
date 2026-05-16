@@ -3,7 +3,13 @@ from __future__ import annotations
 import pytest
 
 from aws_light.iac.parser import ManifestParseError, parse_manifests
-from aws_light.models.manifest import BucketManifest, ManifestKind, SecretManifest, ServiceManifest
+from aws_light.models.manifest import (
+    BucketManifest,
+    ManifestKind,
+    SecretManifest,
+    SecretsManifest,
+    ServiceManifest,
+)
 
 _SERVICE_YAML = """\
 apiVersion: aws-light/v1
@@ -93,3 +99,37 @@ spec:
     manifests = parse_manifests(yaml_text)
     assert isinstance(manifests[0], ServiceManifest)
     assert manifests[0].spec.secret_refs == ["my-secret", "other-secret"]
+
+
+def test_parse_secrets_bundle_manifest() -> None:
+    yaml_text = """\
+apiVersion: aws-light/v1
+kind: Secrets
+secrets:
+  db-password: supersecret
+  api-key: abc123
+"""
+    manifests = parse_manifests(yaml_text)
+    assert len(manifests) == 1
+    assert isinstance(manifests[0], SecretsManifest)
+    assert manifests[0].secrets == {"db-password": "supersecret", "api-key": "abc123"}
+
+
+def test_parse_secrets_bundle_mixed_document() -> None:
+    yaml_text = """\
+apiVersion: aws-light/v1
+kind: Secrets
+secrets:
+  pw: secret
+---
+apiVersion: aws-light/v1
+kind: Bucket
+metadata:
+  name: my-bucket
+spec:
+  versioning: false
+"""
+    manifests = parse_manifests(yaml_text)
+    assert len(manifests) == 2
+    assert isinstance(manifests[0], SecretsManifest)
+    assert isinstance(manifests[1], BucketManifest)

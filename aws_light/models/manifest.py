@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class ManifestKind(str, Enum):
     SERVICE = "Service"
     SECRET = "Secret"
+    SECRETS = "Secrets"
     BUCKET = "Bucket"
 
 
@@ -59,6 +60,16 @@ class SecretManifest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class SecretsManifest(BaseModel):
+    """Defines multiple secrets in one document under a top-level `secrets:` map."""
+
+    api_version: str = Field(default="aws-light/v1", alias="apiVersion")
+    kind: Literal[ManifestKind.SECRETS]
+    secrets: dict[str, str]
+
+    model_config = {"populate_by_name": True}
+
+
 class BucketManifest(BaseModel):
     api_version: str = Field(default="aws-light/v1", alias="apiVersion")
     kind: Literal[ManifestKind.BUCKET]
@@ -69,6 +80,6 @@ class BucketManifest(BaseModel):
 
 
 AnyManifest = Annotated[
-    ServiceManifest | SecretManifest | BucketManifest,
+    ServiceManifest | SecretManifest | SecretsManifest | BucketManifest,
     Field(discriminator="kind"),
 ]

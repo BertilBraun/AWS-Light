@@ -13,6 +13,7 @@ class ReplicaState(BaseModel):
     node_id: str
     status: ResourceStatus
     host_port: int
+    image: str = ""
     cpu_percent: float = 0.0
     memory_mb: float = 0.0
     started_at: datetime

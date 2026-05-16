@@ -1,16 +1,8 @@
 apiVersion: aws-light/v1
-kind: Secret
-metadata:
-  name: my-secret
-spec:
-  value: hello-from-secret
----
-apiVersion: aws-light/v1
-kind: Secret
-metadata:
-  name: another-secret
-spec:
-  value: second-secret-value
+kind: Secrets
+secrets:
+  my-secret: hello-from-secret
+  another-secret: second-secret-value
 ---
 apiVersion: aws-light/v1
 kind: Service

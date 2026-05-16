@@ -10,6 +10,7 @@ from aws_light.models.manifest import (
     AnyManifest,
     BucketManifest,
     SecretManifest,
+    SecretsManifest,
     ServiceManifest,
 )
 from aws_light.models.service import ServiceSpec, ServiceState
@@ -44,15 +45,13 @@ class Applier:
     async def apply(self, manifests: list[AnyManifest]) -> list[ApplyResult]:
         results = []
         for manifest in manifests:
-            result = await self._apply_one(manifest)
-            results.append(result)
+            results.extend(await self._apply_one(manifest))
         return results
 
     async def destroy(self, manifests: list[AnyManifest]) -> list[ApplyResult]:
         results = []
         for manifest in manifests:
-            result = await self._destroy_one(manifest)
-            results.append(result)
+            results.extend(await self._destroy_one(manifest))
         return results
 
     async def diff(self, manifests: list[AnyManifest]) -> list[ManifestDiff]:
@@ -62,21 +61,34 @@ class Applier:
             diffs.append(self._differ.compute_diff(manifest, current))
         return diffs
 
-    async def _apply_one(self, manifest: AnyManifest) -> ApplyResult:
-        kind = manifest.kind.value
-        name = manifest.metadata.name
+    async def _apply_one(self, manifest: AnyManifest) -> list[ApplyResult]:
         try:
             match manifest:
                 case ServiceManifest():
-                    return await self._apply_service(manifest)
+                    return [await self._apply_service(manifest)]
                 case SecretManifest():
-                    return await self._apply_secret(manifest)
+                    return [await self._apply_secret(manifest.metadata.name, manifest.spec.value)]
+                case SecretsManifest():
+                    return [
+                        await self._apply_secret(name, value)
+                        for name, value in manifest.secrets.items()
+                    ]
                 case BucketManifest():
-                    return await self._apply_bucket(manifest)
+                    return [await self._apply_bucket(manifest)]
                 case _:
-                    return ApplyResult(kind=kind, name=name, action="error", detail="Unknown kind")
+                    return [
+                        ApplyResult(
+                            kind="unknown", name="unknown", action="error", detail="Unknown kind"
+                        )
+                    ]
         except Exception as error:
-            return ApplyResult(kind=kind, name=name, action="error", detail=str(error))
+            kind = manifest.kind.value
+            name = (
+                manifest.metadata.name
+                if isinstance(manifest, ServiceManifest | SecretManifest | BucketManifest)
+                else "bundle"
+            )
+            return [ApplyResult(kind=kind, name=name, action="error", detail=str(error))]
 
     async def _apply_service(self, manifest: ServiceManifest) -> ApplyResult:
         name = manifest.metadata.name
@@ -111,13 +123,12 @@ class Applier:
             await self._service_store.put(name, existing)
             return ApplyResult(kind="Service", name=name, action="updated")
 
-    async def _apply_secret(self, manifest: SecretManifest) -> ApplyResult:
-        name = manifest.metadata.name
+    async def _apply_secret(self, name: str, value: str) -> ApplyResult:
         if await self._secrets_manager.exists(name):
             await self._secrets_manager.delete_secret(name)
-            await self._secrets_manager.create_secret(name, manifest.spec.value)
+            await self._secrets_manager.create_secret(name, value)
             return ApplyResult(kind="Secret", name=name, action="updated")
-        await self._secrets_manager.create_secret(name, manifest.spec.value)
+        await self._secrets_manager.create_secret(name, value)
         await self._emit(EventKind.SECRET_CREATED, {"secret_name": name})
         return ApplyResult(kind="Secret", name=name, action="created")
 
@@ -129,24 +140,80 @@ class Applier:
         await self._emit(EventKind.BUCKET_CREATED, {"bucket_name": name})
         return ApplyResult(kind="Bucket", name=name, action="created")
 
-    async def _destroy_one(self, manifest: AnyManifest) -> ApplyResult:
-        kind = manifest.kind.value
-        name = manifest.metadata.name
+    async def _destroy_one(self, manifest: AnyManifest) -> list[ApplyResult]:
         try:
             match manifest:
-                case ServiceManifest() if await self._service_store.exists(name):
-                    await self._service_store.delete(name)
-                    return ApplyResult(kind=kind, name=name, action="updated", detail="deleted")
-                case SecretManifest() if await self._secrets_manager.exists(name):
-                    await self._secrets_manager.delete_secret(name)
-                    return ApplyResult(kind=kind, name=name, action="updated", detail="deleted")
-                case BucketManifest() if self._storage_service.bucket_exists(name):
-                    self._storage_service.delete_bucket(name)
-                    return ApplyResult(kind=kind, name=name, action="updated", detail="deleted")
+                case ServiceManifest() if await self._service_store.exists(manifest.metadata.name):
+                    await self._service_store.delete(manifest.metadata.name)
+                    return [
+                        ApplyResult(
+                            kind=manifest.kind.value,
+                            name=manifest.metadata.name,
+                            action="updated",
+                            detail="deleted",
+                        )
+                    ]
+                case SecretManifest() if await self._secrets_manager.exists(manifest.metadata.name):
+                    await self._secrets_manager.delete_secret(manifest.metadata.name)
+                    return [
+                        ApplyResult(
+                            kind=manifest.kind.value,
+                            name=manifest.metadata.name,
+                            action="updated",
+                            detail="deleted",
+                        )
+                    ]
+                case SecretsManifest():
+                    results = []
+                    for name in manifest.secrets:
+                        if await self._secrets_manager.exists(name):
+                            await self._secrets_manager.delete_secret(name)
+                            results.append(
+                                ApplyResult(
+                                    kind="Secret", name=name, action="updated", detail="deleted"
+                                )
+                            )
+                        else:
+                            results.append(
+                                ApplyResult(
+                                    kind="Secret", name=name, action="unchanged", detail="not found"
+                                )
+                            )
+                    return results
+                case BucketManifest() if self._storage_service.bucket_exists(
+                    manifest.metadata.name
+                ):
+                    self._storage_service.delete_bucket(manifest.metadata.name)
+                    return [
+                        ApplyResult(
+                            kind=manifest.kind.value,
+                            name=manifest.metadata.name,
+                            action="updated",
+                            detail="deleted",
+                        )
+                    ]
                 case _:
-                    return ApplyResult(kind=kind, name=name, action="unchanged", detail="not found")
+                    name = (
+                        manifest.metadata.name
+                        if isinstance(manifest, ServiceManifest | SecretManifest | BucketManifest)
+                        else "bundle"
+                    )
+                    return [
+                        ApplyResult(
+                            kind=manifest.kind.value,
+                            name=name,
+                            action="unchanged",
+                            detail="not found",
+                        )
+                    ]
         except Exception as error:
-            return ApplyResult(kind=kind, name=name, action="error", detail=str(error))
+            kind = manifest.kind.value
+            name = (
+                manifest.metadata.name
+                if isinstance(manifest, ServiceManifest | SecretManifest | BucketManifest)
+                else "bundle"
+            )
+            return [ApplyResult(kind=kind, name=name, action="error", detail=str(error))]
 
     async def _fetch_current(self, manifest: AnyManifest) -> AnyManifest | None:
         return None

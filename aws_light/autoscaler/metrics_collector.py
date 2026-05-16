@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from aws_light.compute.docker_client import DockerClient
 from aws_light.models.service import ServiceState
+from aws_light.proxy.proxy_server import ProxyServer
 from aws_light.store.json_store import JsonStore
 
 
@@ -18,14 +19,12 @@ class MetricsCollector:
         self,
         docker_client: DockerClient,
         service_store: JsonStore[ServiceState],
+        proxy_server: ProxyServer,
     ) -> None:
         self._docker_client = docker_client
         self._service_store = service_store
-        self._request_counts: dict[str, int] = {}
+        self._proxy_server = proxy_server
         self._last_request_counts: dict[str, int] = {}
-
-    def record_request(self, service_name: str) -> None:
-        self._request_counts[service_name] = self._request_counts.get(service_name, 0) + 1
 
     async def collect(self, service_name: str) -> ServiceMetrics:
         service_state = await self._service_store.get(service_name)
@@ -40,10 +39,10 @@ class MetricsCollector:
 
         average_cpu = sum(cpu_samples) / len(cpu_samples) if cpu_samples else 0.0
 
-        current_count = self._request_counts.get(service_name, 0)
-        last_count = self._last_request_counts.get(service_name, 0)
         from aws_light.config import settings
 
+        current_count = self._proxy_server.get_request_count(service_name)
+        last_count = self._last_request_counts.get(service_name, 0)
         elapsed_seconds = settings.autoscaler_interval_seconds
         requests_per_second = max(0.0, (current_count - last_count) / elapsed_seconds)
         self._last_request_counts[service_name] = current_count

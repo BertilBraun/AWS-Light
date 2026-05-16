@@ -82,6 +82,19 @@ class ComputeOrchestrator:
         actual_count = len(running_replicas)
         replicas_changed = False
 
+        # Replace replicas whose image doesn't match the desired spec
+        stale_replicas = [r for r in running_replicas if r.image and r.image != spec.image]
+        for stale in stale_replicas:
+            await self._remove_replica(service_state, stale)
+            replicas_changed = True
+
+        if stale_replicas:
+            service_state = await self._service_store.get(spec.name) or service_state
+            running_replicas = [
+                r for r in service_state.replicas if r.status == ResourceStatus.RUNNING
+            ]
+            actual_count = len(running_replicas)
+
         if actual_count < desired_count:
             for _ in range(desired_count - actual_count):
                 await self._create_replica(service_state)
@@ -159,6 +172,7 @@ class ComputeOrchestrator:
             node_id=target_node.spec.node_id,
             status=ResourceStatus.RUNNING,
             host_port=host_port,
+            image=spec.image,
             started_at=datetime.utcnow(),
         )
 
