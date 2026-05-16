@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS Light Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>&#9729; AWS Light</h1>
+    <span id="connection-status" class="disconnected">disconnected</span>
+  </header>
+
+  <main>
+    <section id="nodes-section">
+      <h2>Nodes</h2>
+      <div id="node-grid"></div>
+    </section>
+
+    <section id="services-section">
+      <h2>Services <span class="hint">click a row to inspect</span></h2>
+      <table id="services-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Image</th>
+            <th>Status</th>
+            <th>Replicas</th>
+          </tr>
+        </thead>
+        <tbody id="services-body"></tbody>
+      </table>
+      <div id="detail-panel" hidden></div>
+    </section>
+
+    <section id="secrets-section">
+      <h2>Secrets</h2>
+      <ul id="secrets-list"></ul>
+    </section>
+
+    <section id="buckets-section">
+      <h2>Buckets</h2>
+      <ul id="buckets-list"></ul>
+    </section>
+
+    <section id="events-section">
+      <h2>Event Log</h2>
+      <ul id="event-log"></ul>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+apiVersion: aws-light/v1
+kind: Secret
+metadata:
+  name: my-secret
+spec:
+  value: hello-from-secret
+---
+apiVersion: aws-light/v1
+kind: Secret
+metadata:
+  name: another-secret
+spec:
+  value: second-secret-value
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: hello-service
+spec:
+  image: aws-light/hello-service:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 3
+  cpuRequest: 0.1
+  memoryRequestMb: 64
+  port: 8000
+  healthCheckPath: /health
+  env: {}
+  secretRefs:
+    - my-secret
+    - another-secret

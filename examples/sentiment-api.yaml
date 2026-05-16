@@ -1,0 +1,34 @@
+apiVersion: aws-light/v1
+kind: Secret
+metadata:
+  name: openai-api-key
+spec:
+  value: sk-replace-me
+---
+apiVersion: aws-light/v1
+kind: Bucket
+metadata:
+  name: model-artifacts
+spec:
+  versioning: false
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: sentiment-api
+  labels:
+    team: ml
+    env: demo
+spec:
+  image: nginx:alpine
+  replicas: 2
+  minReplicas: 1
+  maxReplicas: 5
+  cpuRequest: 0.1
+  memoryRequestMb: 64
+  port: 80
+  healthCheckPath: /
+  env:
+    LOG_LEVEL: info
+  secretRefs:
+    - openai-api-key
