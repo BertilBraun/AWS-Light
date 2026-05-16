@@ -1,35 +1,34 @@
-import json
 import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from fastapi import FastAPI, status
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
 
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
-            self._respond(200, {"status": "ok"})
-        elif self.path == "/":
-            self._respond(
-                200,
-                {
-                    "my_secret": os.environ.get("MY_SECRET", "<not set>"),
-                    "another_secret": os.environ.get("ANOTHER_SECRET", "<not set>"),
-                },
-            )
-        else:
-            self._respond(404, {"error": "not found"})
-
-    def _respond(self, status: int, body: dict) -> None:
-        payload = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        pass
+@app.get('/health')
+def health() -> dict[str, str]:
+    return {'status': 'ok'}
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+@app.get('/')
+def root() -> dict[str, str]:
+    return {
+        'my_secret': os.environ.get('MY_SECRET', '<not set>'),
+        'another_secret': os.environ.get('ANOTHER_SECRET', '<not set>'),
+    }
+
+
+@app.exception_handler(404)
+def not_found(_request: object, _exc: object) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={'error': 'not found'},
+    )
+
+
+if __name__ == '__main__':
+    import uvicorn
+
+    port = int(os.environ.get('PORT', '8000'))
+    uvicorn.run(app, host='0.0.0.0', port=port)
