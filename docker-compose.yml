@@ -1,0 +1,107 @@
+networks:
+  internal:
+    driver: bridge
+  data:
+    # Owned by the orchestrator — it creates this network on startup before
+    # the proxy and health-checker attach managed containers to it.
+    external: true
+    name: aws-light-data
+
+volumes:
+  postgres-data:
+  storage-data:
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    networks: [internal]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: awslight
+      POSTGRES_USER: awslight
+      POSTGRES_PASSWORD: awslight
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U awslight"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: services/control-plane/Dockerfile
+    networks: [internal]
+    ports: ["8000:8000"]
+    volumes:
+      - storage-data:/app/data/storage
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/healthz || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    networks: [internal]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Writes /app/healthy after creating aws-light-data network so that the
+    # proxy and health-checker don't try to join the network before it exists.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/healthy"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+
+  proxy:
+    build:
+      context: .
+      dockerfile: services/proxy/Dockerfile
+    networks: [internal, data]
+    ports: ["8080:8080"]
+    env_file: .env
+    depends_on:
+      redis:        { condition: service_healthy }
+      orchestrator: { condition: service_healthy }
+
+  health-checker:
+    build:
+      context: .
+      dockerfile: services/health-checker/Dockerfile
+    networks: [internal, data]
+    env_file: .env
+    depends_on:
+      postgres:     { condition: service_healthy }
+      redis:        { condition: service_healthy }
+      orchestrator: { condition: service_healthy }
+
+  autoscaler:
+    build:
+      context: .
+      dockerfile: services/autoscaler/Dockerfile
+    networks: [internal]
+    env_file: .env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }

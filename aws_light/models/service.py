@@ -12,7 +12,7 @@ class ReplicaState(BaseModel):
     container_id: str
     node_id: str
     status: ResourceStatus
-    host_port: int
+    container_ip: str = ""
     image: str = ""
     cpu_percent: float = 0.0
     memory_mb: float = 0.0
@@ -38,5 +38,6 @@ class ServiceState(BaseModel):
     spec: ServiceSpec
     status: ResourceStatus = ResourceStatus.PENDING
     replicas: list[ReplicaState] = Field(default_factory=list)
+    created_by: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

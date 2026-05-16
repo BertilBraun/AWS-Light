@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from aws_light.proxy.routing_table import ReplicaEndpoint, RoutingTable
+from aws_light.proxy.routing_table import AnyRoutingTable, ReplicaEndpoint
 
 
 class NoHealthyReplicaError(Exception):
@@ -10,7 +10,7 @@ class NoHealthyReplicaError(Exception):
 
 
 class RoundRobinBalancer:
-    def __init__(self, routing_table: RoutingTable) -> None:
+    def __init__(self, routing_table: AnyRoutingTable) -> None:
         self._routing_table = routing_table
         self._counters: dict[str, int] = {}
         self._lock = asyncio.Lock()

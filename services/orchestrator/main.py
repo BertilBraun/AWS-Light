@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+
+import asyncpg
+import redis.asyncio as aioredis
+
+import aws_light.log as log
+from aws_light.compute.docker_client import DockerClient
+from aws_light.compute.node_manager import NodeManager
+from aws_light.compute.orchestrator import ComputeOrchestrator
+from aws_light.compute.scheduler import BinPackScheduler
+from aws_light.config import settings
+from aws_light.dashboard.event_bus import EventBus
+from aws_light.models.deployment import RolloutState
+from aws_light.models.secret import SecretSpec
+from aws_light.models.service import ServiceState
+from aws_light.proxy.redis_routing_table import RedisRoutingTable
+from aws_light.secrets.secrets_manager import SecretsManager
+from aws_light.store.postgres_store import PostgresStore
+
+logger = logging.getLogger(__name__)
+
+_HEALTHY_MARKER = Path("/app/healthy")
+
+
+async def main() -> None:
+    log.configure("orchestrator")
+
+    # Create the managed-container Docker network synchronously before any
+    # async work. The proxy and health-checker containers join this network
+    # and must not start until it exists (see docker-compose.yml healthcheck).
+    docker_client = DockerClient()
+    docker_client.ensure_network(settings.docker_network)
+    _HEALTHY_MARKER.touch()
+    logger.info("Network %s ready", settings.docker_network)
+
+    pool = await asyncpg.create_pool(settings.database_url, min_size=2, max_size=5)
+    redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+    event_bus = EventBus()
+
+    service_store: PostgresStore[ServiceState] = PostgresStore(pool, "services", ServiceState)
+    deployment_store: PostgresStore[RolloutState] = PostgresStore(pool, "deployments", RolloutState)
+    secret_store: PostgresStore[SecretSpec] = PostgresStore(pool, "secrets", SecretSpec)
+
+    routing_table = RedisRoutingTable(redis_client)
+    secrets_manager = SecretsManager(secret_store=secret_store)
+    node_manager = NodeManager()
+    scheduler = BinPackScheduler()
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,
+        node_manager=node_manager,
+        scheduler=scheduler,
+        event_bus=event_bus,
+        routing_table=routing_table,
+        secrets_manager=secrets_manager,
+        redis_client=redis_client,
+    )
+
+    await orchestrator.start()
+    logger.info(
+        "Orchestrator started — reconcile interval %ds", settings.reconcile_interval_seconds
+    )
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await orchestrator.stop()
+        await redis_client.aclose()
+        await pool.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

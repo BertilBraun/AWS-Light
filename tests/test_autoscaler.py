@@ -5,14 +5,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from aws_light.autoscaler.autoscaler import (
-    _SCALE_DOWN_CONSECUTIVE_CHECKS_REQUIRED,
-    _SCALE_DOWN_CPU_THRESHOLD,
-    _SCALE_DOWN_RPS_THRESHOLD,
-    _SCALE_UP_CPU_THRESHOLD,
-    Autoscaler,
-)
+from aws_light.autoscaler.autoscaler import Autoscaler
 from aws_light.autoscaler.metrics_collector import MetricsCollector, ServiceMetrics
+from aws_light.config import settings
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.models.common import ResourceStatus
 from aws_light.models.service import ServiceSpec, ServiceState
@@ -79,7 +74,8 @@ async def test_scale_up_when_cpu_above_threshold(
     await service_store.put("svc", service)
     mock_metrics.collect = AsyncMock(  # type: ignore[method-assign]
         return_value=ServiceMetrics(
-            average_cpu_percent=_SCALE_UP_CPU_THRESHOLD + 1, requests_per_second=0.0
+            average_cpu_percent=settings.autoscaler_cpu_scale_up_threshold + 1,
+            requests_per_second=0.0,
         )
     )
     await autoscaler._evaluate_all_services()
@@ -113,11 +109,11 @@ async def test_scale_down_requires_consecutive_checks(
     await service_store.put("svc", service)
     mock_metrics.collect = AsyncMock(  # type: ignore[method-assign]
         return_value=ServiceMetrics(
-            average_cpu_percent=_SCALE_DOWN_CPU_THRESHOLD - 1,
-            requests_per_second=_SCALE_DOWN_RPS_THRESHOLD - 1,
+            average_cpu_percent=settings.autoscaler_cpu_scale_down_threshold - 1,
+            requests_per_second=settings.autoscaler_rps_scale_down_threshold - 1,
         )
     )
-    for _ in range(_SCALE_DOWN_CONSECUTIVE_CHECKS_REQUIRED - 1):
+    for _ in range(settings.autoscaler_scale_down_consecutive_checks - 1):
         await autoscaler._evaluate_all_services()
 
     still_same = await service_store.get("svc")
@@ -140,7 +136,7 @@ async def test_scale_down_clamps_at_min_replicas(
     mock_metrics.collect = AsyncMock(  # type: ignore[method-assign]
         return_value=ServiceMetrics(average_cpu_percent=0.0, requests_per_second=0.0)
     )
-    for _ in range(_SCALE_DOWN_CONSECUTIVE_CHECKS_REQUIRED):
+    for _ in range(settings.autoscaler_scale_down_consecutive_checks):
         await autoscaler._evaluate_all_services()
     not_scaled = await service_store.get("svc")
     assert not_scaled is not None

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import defaultdict
+from typing import TYPE_CHECKING
 
 from aws_light.proxy.load_balancer import NoHealthyReplicaError, RoundRobinBalancer
+
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +29,15 @@ _502_RESPONSE = (
 
 
 class ProxyServer:
-    def __init__(self, balancer: RoundRobinBalancer, port: int) -> None:
+    def __init__(
+        self,
+        balancer: RoundRobinBalancer,
+        port: int,
+        redis_client: Redis | None = None,  # type: ignore[type-arg]
+    ) -> None:
         self._balancer = balancer
         self._port = port
-        self._request_counts: dict[str, int] = defaultdict(int)
+        self._redis = redis_client
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
@@ -40,12 +48,6 @@ class ProxyServer:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
-
-    def get_request_count(self, service_name: str) -> int:
-        return self._request_counts.get(service_name, 0)
-
-    def reset_request_count(self, service_name: str) -> None:
-        self._request_counts[service_name] = 0
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -77,11 +79,12 @@ class ProxyServer:
             await writer.drain()
             return
 
-        self._request_counts[service_name] += 1
+        if self._redis is not None:
+            await self._redis.incr(f"rps:{service_name}")
 
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection("127.0.0.1", endpoint.port), timeout=5.0
+                asyncio.open_connection(endpoint.host, endpoint.port), timeout=5.0
             )
         except (OSError, asyncio.TimeoutError):
             writer.write(_502_RESPONSE)
@@ -89,7 +92,7 @@ class ProxyServer:
             return
 
         is_websocket = _is_websocket_upgrade(header_bytes)
-        rewritten_headers = _rewrite_host_header(header_bytes, endpoint.port)
+        rewritten_headers = _rewrite_host_header(header_bytes, endpoint.host, endpoint.port)
         upstream_writer.write(rewritten_headers)
         await upstream_writer.drain()
 
@@ -128,16 +131,15 @@ def _extract_service_name(header_bytes: bytes) -> str | None:
 
 
 def _is_websocket_upgrade(header_bytes: bytes) -> bool:
-    lower = header_bytes.lower()
-    return b"upgrade: websocket" in lower
+    return b"upgrade: websocket" in header_bytes.lower()
 
 
-def _rewrite_host_header(header_bytes: bytes, upstream_port: int) -> bytes:
+def _rewrite_host_header(header_bytes: bytes, upstream_host: str, upstream_port: int) -> bytes:
     lines = header_bytes.split(b"\r\n")
     rewritten = []
     for line in lines:
         if line.lower().startswith(b"host:"):
-            rewritten.append(f"Host: localhost:{upstream_port}".encode())
+            rewritten.append(f"Host: {upstream_host}:{upstream_port}".encode())
         else:
             rewritten.append(line)
     return b"\r\n".join(rewritten)

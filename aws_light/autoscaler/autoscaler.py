@@ -13,12 +13,6 @@ from aws_light.store.json_store import JsonStore
 
 logger = logging.getLogger(__name__)
 
-_SCALE_UP_CPU_THRESHOLD = 70.0
-_SCALE_UP_RPS_THRESHOLD = 100.0
-_SCALE_DOWN_CPU_THRESHOLD = 20.0
-_SCALE_DOWN_RPS_THRESHOLD = 10.0
-_SCALE_DOWN_CONSECUTIVE_CHECKS_REQUIRED = 3
-
 
 class Autoscaler:
     def __init__(
@@ -62,12 +56,12 @@ class Autoscaler:
         metrics = await self._metrics_collector.collect(spec.name)
 
         scale_up = (
-            metrics.average_cpu_percent > _SCALE_UP_CPU_THRESHOLD
-            or metrics.requests_per_second > _SCALE_UP_RPS_THRESHOLD
+            metrics.average_cpu_percent > settings.autoscaler_cpu_scale_up_threshold
+            or metrics.requests_per_second > settings.autoscaler_rps_scale_up_threshold
         )
         scale_down_candidate = (
-            metrics.average_cpu_percent < _SCALE_DOWN_CPU_THRESHOLD
-            and metrics.requests_per_second < _SCALE_DOWN_RPS_THRESHOLD
+            metrics.average_cpu_percent < settings.autoscaler_cpu_scale_down_threshold
+            and metrics.requests_per_second < settings.autoscaler_rps_scale_down_threshold
         )
 
         if scale_up and current_replicas < spec.max_replicas:
@@ -77,7 +71,7 @@ class Autoscaler:
         elif scale_down_candidate and current_replicas > spec.min_replicas:
             consecutive = self._scale_down_counters.get(spec.name, 0) + 1
             self._scale_down_counters[spec.name] = consecutive
-            if consecutive >= _SCALE_DOWN_CONSECUTIVE_CHECKS_REQUIRED:
+            if consecutive >= settings.autoscaler_scale_down_consecutive_checks:
                 new_replica_count = max(current_replicas - 1, spec.min_replicas)
                 self._scale_down_counters.pop(spec.name, None)
                 await self._apply_scale(service_state, new_replica_count, "scale_down", metrics)

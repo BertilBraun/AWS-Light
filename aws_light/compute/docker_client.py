@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 
 import docker
 import docker.errors
 from docker.models.containers import Container
+
+from aws_light.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,10 +49,9 @@ class DockerClient:
         memory_mb: int,
         network: str,
         labels: dict[str, str],
-        host_port: int,
         container_port: int,
-    ) -> str:
-        # Docker cpu_quota is in microseconds per 100ms period (100000 = 1 full core)
+    ) -> tuple[str, str]:
+        """Create a container and return (container_id, container_ip)."""
         cpu_quota_microseconds = int(cpu_quota * 100000)
         container: Container = self._client.containers.run(
             image,
@@ -57,10 +62,32 @@ class DockerClient:
             mem_limit=f"{memory_mb}m",
             network=network,
             labels=labels,
-            ports={f"{container_port}/tcp": host_port},
             remove=False,
         )
-        return container.id  # type: ignore[no-any-return]
+        container_ip = self._poll_container_ip(container, network)
+        return container.id, container_ip  # type: ignore[return-value]
+
+    def _poll_container_ip(self, container: Container, network: str) -> str:
+        for _ in range(settings.container_ip_poll_retries):
+            container.reload()
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            ip = networks.get(network, {}).get("IPAddress", "")
+            if ip:
+                return ip
+            time.sleep(0.2)
+        logger.warning(
+            "Could not get IP for container %s on network %s", container.id[:12], network
+        )
+        return ""
+
+    def get_container_ip(self, container_id: str, network: str) -> str:
+        try:
+            container: Container = self._client.containers.get(container_id)
+            container.reload()
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            return networks.get(network, {}).get("IPAddress", "")  # type: ignore[no-any-return]
+        except docker.errors.NotFound:
+            return ""
 
     def remove_container(self, container_id: str) -> None:
         try:

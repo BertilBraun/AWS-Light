@@ -4,9 +4,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import redis.asyncio as aioredis
 from fastapi import FastAPI
 
 import aws_light.config as config_module
+import aws_light.log as log
 from aws_light.api import deployments as deployments_router
 from aws_light.api import iac as iac_router
 from aws_light.api import iam as iam_router
@@ -23,7 +25,6 @@ from aws_light.compute.orchestrator import ComputeOrchestrator
 from aws_light.compute.scheduler import BinPackScheduler
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.dependencies import get_user_store
-from aws_light.deployment.rolling_controller import RollingController
 from aws_light.iac.applier import Applier
 from aws_light.iac.differ import Differ
 from aws_light.iam.auth import make_default_admin
@@ -48,7 +49,6 @@ _proxy_server: ProxyServer | None = None
 _health_checker: HealthChecker | None = None
 _event_bus: EventBus | None = None
 _autoscaler: Autoscaler | None = None
-_rolling_controller: RollingController | None = None
 _secrets_manager: SecretsManager | None = None
 _storage_service: StorageService | None = None
 _presigned_service: PresignedUrlService | None = None
@@ -85,11 +85,6 @@ def get_event_bus() -> EventBus:
     return _event_bus
 
 
-def get_rolling_controller() -> RollingController:
-    assert _rolling_controller is not None
-    return _rolling_controller
-
-
 def get_secrets_manager() -> SecretsManager:
     assert _secrets_manager is not None
     return _secrets_manager
@@ -114,12 +109,14 @@ def get_applier() -> Applier:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _service_store, _deployment_store, _node_manager, _orchestrator
     global _routing_table, _proxy_server, _health_checker, _event_bus
-    global _autoscaler, _rolling_controller
-    global _secrets_manager, _storage_service, _presigned_service, _applier
+    global _autoscaler, _secrets_manager, _storage_service, _presigned_service, _applier
 
+    log.configure("control-plane")
     settings = config_module.settings
     settings.ensure_data_directories()
     await _seed_default_admin()
+
+    redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
 
     _event_bus = EventBus()
     _service_store = JsonStore(settings.data_directory / "services.json", ServiceState)
@@ -148,37 +145,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler = BinPackScheduler()
     _orchestrator = ComputeOrchestrator(
         service_store=_service_store,
+        deployment_store=_deployment_store,
         docker_client=docker_client,
         node_manager=_node_manager,
         scheduler=scheduler,
         event_bus=_event_bus,
-        port_counter_path=settings.data_directory / "port_counter.json",
         routing_table=_routing_table,
         secrets_manager=_secrets_manager,
+        redis_client=redis_client,
     )
 
     balancer = RoundRobinBalancer(_routing_table)
-    _proxy_server = ProxyServer(balancer=balancer, port=settings.proxy_port)
+    _proxy_server = ProxyServer(
+        balancer=balancer, port=settings.proxy_port, redis_client=redis_client
+    )
     _health_checker = HealthChecker(
         routing_table=_routing_table,
         service_store=_service_store,
         event_bus=_event_bus,
     )
 
-    metrics_collector = MetricsCollector(
-        docker_client=docker_client,
-        service_store=_service_store,
-        proxy_server=_proxy_server,
-    )
+    metrics_collector = MetricsCollector(redis_client=redis_client)
     _autoscaler = Autoscaler(
         service_store=_service_store,
         metrics_collector=metrics_collector,
-        event_bus=_event_bus,
-    )
-    _rolling_controller = RollingController(
-        service_store=_service_store,
-        deployment_store=_deployment_store,
-        orchestrator=_orchestrator,
         event_bus=_event_bus,
     )
 
@@ -193,6 +183,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await _proxy_server.stop()
     await _health_checker.stop()
     await _orchestrator.stop()
+    await redis_client.aclose()
 
 
 async def _seed_default_admin() -> None:
