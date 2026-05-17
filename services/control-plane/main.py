@@ -17,10 +17,12 @@ from aws_light.api import deployments as deployments_router
 from aws_light.api import iac as iac_router
 from aws_light.api import iam as iam_router
 from aws_light.api import nodes as nodes_router
+from aws_light.api import overview as overview_router
 from aws_light.api import platform as platform_router
 from aws_light.api import secrets as secrets_router
 from aws_light.api import services as services_router
 from aws_light.api import storage as storage_router
+from aws_light.api import topology as topology_router
 from aws_light.api import websocket as websocket_router
 from aws_light.config import settings
 from aws_light.events.redis_event_bus import RedisEventBus
@@ -109,7 +111,9 @@ def create_app(lifespan_override: object = None) -> FastAPI:
     app.include_router(iam_router.router)
     app.include_router(services_router.router)
     app.include_router(nodes_router.router)
+    app.include_router(overview_router.router)
     app.include_router(platform_router.router)
+    app.include_router(topology_router.router)
     app.include_router(deployments_router.router)
     app.include_router(secrets_router.router)
     app.include_router(storage_router.router)

@@ -5,7 +5,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from aws_light.compute.docker_client import DockerClient
-from aws_light.dependencies import get_service_store
+from aws_light.dependencies import get_event_bus, get_node_store, get_service_store
 from aws_light.iam.middleware import get_current_user, require_role
 from aws_light.models.common import ResourceStatus
 from aws_light.models.iam import Role, UserSpec
@@ -73,6 +73,48 @@ async def get_service_logs(
     }
 
 
+@router.get("/{name}/diagnostics")
+async def get_service_diagnostics(
+    name: str,
+    _: UserSpec = Depends(get_current_user),
+) -> dict[str, object]:
+    service_state = await get_service_store().get(name)
+    if service_state is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")
+
+    nodes = {node.spec.node_id: node for node in await get_node_store().list()}
+    events = await get_event_bus().get_recent_events()
+    related_events = [
+        event.model_dump(mode="json")
+        for event in reversed(events)
+        if getattr(event, "payload", {}).get("service_name") == name
+    ][:50]
+    running_replicas = [
+        replica for replica in service_state.replicas if replica.status == ResourceStatus.RUNNING
+    ]
+    warnings = _service_warnings(service_state, nodes)
+
+    return {
+        "service": service_state.model_dump(mode="json"),
+        "desired_replicas": service_state.spec.replicas,
+        "actual_replicas": len(running_replicas),
+        "healthy_replicas": len(running_replicas),
+        "unhealthy_replicas": len(service_state.replicas) - len(running_replicas),
+        "node_placement": [
+            {
+                "node_id": replica.node_id,
+                "replica_id": replica.replica_id,
+                "status": replica.status.value,
+                "container_ip": replica.container_ip,
+                "node_known": replica.node_id in nodes,
+            }
+            for replica in service_state.replicas
+        ],
+        "recent_events": related_events,
+        "warnings": warnings,
+    }
+
+
 @router.patch("/{name}", response_model=ServiceState)
 async def update_service(
     name: str,
@@ -88,6 +130,30 @@ async def update_service(
     existing.updated_at = datetime.utcnow()
     await service_store.put(name, existing)
     return existing
+
+
+def _service_warnings(
+    service_state: ServiceState,
+    nodes: dict[str, object],
+) -> list[str]:
+    warnings = []
+    desired = service_state.spec.replicas
+    running = sum(
+        1 for replica in service_state.replicas if replica.status == ResourceStatus.RUNNING
+    )
+    if running < desired:
+        warnings.append(f"Only {running}/{desired} desired replicas are running")
+
+    for replica in service_state.replicas:
+        if replica.node_id not in nodes:
+            warnings.append(
+                f"Replica {replica.replica_id[:8]} references unknown node {replica.node_id}"
+            )
+        if not replica.container_ip:
+            warnings.append(f"Replica {replica.replica_id[:8]} has no container IP")
+        if replica.status != ResourceStatus.RUNNING:
+            warnings.append(f"Replica {replica.replica_id[:8]} is {replica.status.value}")
+    return warnings
 
 
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)

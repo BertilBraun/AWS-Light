@@ -11,8 +11,16 @@ from fastapi.testclient import TestClient
 
 import aws_light.config as config_module
 import aws_light.dependencies as deps
+from aws_light.dashboard.event_bus import EventBus
 from aws_light.iam.auth import make_default_admin
+from aws_light.models.deployment import RolloutState
 from aws_light.models.iam import UserSpec
+from aws_light.models.node import NodeState
+from aws_light.models.secret import SecretSpec
+from aws_light.models.service import ServiceState
+from aws_light.secrets.secrets_manager import SecretsManager
+from aws_light.storage.presigned import PresignedUrlService
+from aws_light.storage.storage_service import StorageService
 from aws_light.store.json_store import JsonStore
 
 _CONTROL_PLANE_MAIN = Path(__file__).parents[1] / "services" / "control-plane" / "main.py"
@@ -30,7 +38,18 @@ async def _minimal_lifespan(app: FastAPI) -> AsyncIterator[None]:
     config_module.settings.ensure_data_directories()
     data_dir = config_module.settings.data_directory
     user_store: JsonStore[UserSpec] = JsonStore(data_dir / "users.json", UserSpec)
+    secret_store: JsonStore[SecretSpec] = JsonStore(data_dir / "secrets.json", SecretSpec)
     deps._user_store = user_store
+    deps._service_store = JsonStore(data_dir / "services.json", ServiceState)
+    deps._deployment_store = JsonStore(data_dir / "deployments.json", RolloutState)
+    deps._node_store = JsonStore(data_dir / "nodes.json", NodeState)
+    deps._secrets_manager = SecretsManager(secret_store)
+    deps._storage_service = StorageService(data_dir / "storage")
+    deps._presigned_service = PresignedUrlService(
+        secret_key=config_module.settings.jwt_secret,
+        base_url="http://testserver",
+    )
+    deps._event_bus = EventBus()
     admin_username = config_module.settings.default_admin_username
     if not await user_store.exists(admin_username):
         admin = make_default_admin()
