@@ -7,7 +7,7 @@ from datetime import datetime
 
 from aws_light.compute.docker_client import DockerClient
 from aws_light.compute.node_manager import NodeManager
-from aws_light.compute.scheduler import BinPackScheduler, SchedulingError
+from aws_light.compute.scheduler import Scheduler, SchedulingError
 from aws_light.config import settings
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.models.common import ResourceStatus
@@ -36,7 +36,7 @@ class ComputeOrchestrator:
         deployment_store: JsonStore[RolloutState],
         docker_client: DockerClient,
         node_manager: NodeManager,
-        scheduler: BinPackScheduler,
+        scheduler: Scheduler,
         event_bus: EventBus,
         routing_table: AnyRoutingTable,
         secrets_manager: SecretsManager,

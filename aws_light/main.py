@@ -24,7 +24,7 @@ from aws_light.autoscaler.metrics_collector import MetricsCollector
 from aws_light.compute.docker_client import DockerClient
 from aws_light.compute.node_manager import NodeManager
 from aws_light.compute.orchestrator import ComputeOrchestrator
-from aws_light.compute.scheduler import BinPackScheduler
+from aws_light.compute.scheduler import create_scheduler
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.iac.applier import Applier
 from aws_light.iac.differ import Differ
@@ -100,7 +100,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         deployment_store=deployment_store,
         docker_client=docker_client,
         node_manager=node_manager,
-        scheduler=BinPackScheduler(),
+        scheduler=create_scheduler(settings.scheduler_policy),
         event_bus=event_bus,
         routing_table=routing_table,
         secrets_manager=secrets_manager,

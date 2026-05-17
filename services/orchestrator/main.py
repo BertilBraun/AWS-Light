@@ -11,7 +11,7 @@ import aws_light.log as log
 from aws_light.compute.docker_client import DockerClient
 from aws_light.compute.node_manager import NodeManager
 from aws_light.compute.orchestrator import ComputeOrchestrator
-from aws_light.compute.scheduler import BinPackScheduler
+from aws_light.compute.scheduler import create_scheduler
 from aws_light.config import settings
 from aws_light.events.redis_event_bus import RedisEventBus
 from aws_light.models.deployment import RolloutState
@@ -53,7 +53,7 @@ async def main() -> None:
     routing_table = RedisRoutingTable(redis_client)
     secrets_manager = SecretsManager(secret_store=secret_store)
     node_manager = NodeManager()
-    scheduler = BinPackScheduler()
+    scheduler = create_scheduler(settings.scheduler_policy)
 
     orchestrator = ComputeOrchestrator(
         service_store=service_store,
@@ -70,7 +70,9 @@ async def main() -> None:
 
     await orchestrator.start()
     logger.info(
-        "Orchestrator started — reconcile interval %ds", settings.reconcile_interval_seconds
+        "Orchestrator started — reconcile interval %ds, scheduler=%s",
+        settings.reconcile_interval_seconds,
+        settings.scheduler_policy,
     )
 
     try:

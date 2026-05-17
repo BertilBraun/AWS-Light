@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     node_count: int = 10
     node_cpu_capacity: float = 0.5
     node_memory_capacity_mb: int = 512
+    scheduler_policy: str = "binpack"
 
     # ── Orchestrator ──────────────────────────────────────────────────────────
     reconcile_interval_seconds: int = 5

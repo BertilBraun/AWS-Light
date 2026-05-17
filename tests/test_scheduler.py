@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from aws_light.compute.scheduler import BinPackScheduler, SchedulingError
+from aws_light.compute.scheduler import (
+    BinPackScheduler,
+    SchedulingError,
+    SpreadScheduler,
+    create_scheduler,
+)
 from aws_light.models.common import ResourceStatus
 from aws_light.models.node import NodeSpec, NodeState, ResourceUsage
 
@@ -21,24 +26,40 @@ def _make_node(
     )
 
 
-def test_select_node_prefers_node_with_fewest_replicas() -> None:
+def test_binpack_select_node_picks_most_full_node_that_fits() -> None:
     scheduler = BinPackScheduler()
+    lightly_loaded = _make_node("node-00", cpu_used=0.0)
+    heavily_loaded = _make_node("node-01", cpu_used=0.25)
+    selected = scheduler.select_node([lightly_loaded, heavily_loaded], 0.1, 64)
+    assert selected.spec.node_id == "node-01"
+
+
+def test_binpack_moves_to_next_node_when_request_does_not_fit() -> None:
+    scheduler = BinPackScheduler()
+    mostly_full = _make_node("node-00", cpu_used=0.3, replica_ids=["replica-1"])
+    empty = _make_node("node-01")
+    selected = scheduler.select_node([mostly_full, empty], 0.3, 128)
+    assert selected.spec.node_id == "node-01"
+
+
+def test_spread_select_node_prefers_node_with_fewest_replicas() -> None:
+    scheduler = SpreadScheduler()
     occupied = _make_node("node-00", cpu_used=0.1, replica_ids=["replica-1"])
     empty = _make_node("node-01", cpu_used=0.0)
     selected = scheduler.select_node([occupied, empty], 0.1, 64)
     assert selected.spec.node_id == "node-01"
 
 
-def test_select_node_spreads_across_empty_nodes_by_name() -> None:
-    scheduler = BinPackScheduler()
+def test_spread_select_node_sorts_empty_nodes_by_name() -> None:
+    scheduler = SpreadScheduler()
     second = _make_node("node-01")
     first = _make_node("node-00")
     selected = scheduler.select_node([second, first], 0.1, 64)
     assert selected.spec.node_id == "node-00"
 
 
-def test_select_node_uses_load_as_tiebreaker() -> None:
-    scheduler = BinPackScheduler()
+def test_spread_select_node_uses_load_as_tiebreaker() -> None:
+    scheduler = SpreadScheduler()
     lightly_loaded = _make_node("node-00", cpu_used=0.1, replica_ids=["replica-1"])
     heavily_loaded = _make_node("node-01", cpu_used=0.2, replica_ids=["replica-2"])
     selected = scheduler.select_node([heavily_loaded, lightly_loaded], 0.1, 64)
@@ -70,3 +91,13 @@ def test_select_node_with_exact_fit_succeeds() -> None:
     node = _make_node("node-00", cpu_used=0.25, memory_used_mb=256)
     selected = scheduler.select_node([node], cpu_request=0.25, memory_request_mb=256)
     assert selected.spec.node_id == "node-00"
+
+
+def test_create_scheduler_returns_requested_policy() -> None:
+    assert isinstance(create_scheduler("binpack"), BinPackScheduler)
+    assert isinstance(create_scheduler("spread"), SpreadScheduler)
+
+
+def test_create_scheduler_rejects_unknown_policy() -> None:
+    with pytest.raises(ValueError, match="Unknown scheduler policy"):
+        create_scheduler("random")

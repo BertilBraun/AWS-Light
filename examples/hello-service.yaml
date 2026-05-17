@@ -13,8 +13,8 @@ spec:
   replicas: 2
   minReplicas: 2
   maxReplicas: 3
-  cpuRequest: 0.1
-  memoryRequestMb: 64
+  cpuRequest: 0.3
+  memoryRequestMb: 128
   port: 8000
   healthCheckPath: /health
   env: {}
