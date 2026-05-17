@@ -63,6 +63,25 @@ class Autoscaler:
             metrics.average_cpu_percent < settings.autoscaler_cpu_scale_down_threshold
             and metrics.requests_per_second < settings.autoscaler_rps_scale_down_threshold
         )
+        await self._event_bus.publish(
+            WebSocketEvent(
+                kind=EventKind.AUTOSCALE_EVALUATED,
+                payload={
+                    "service_name": spec.name,
+                    "current_replicas": current_replicas,
+                    "min_replicas": spec.min_replicas,
+                    "max_replicas": spec.max_replicas,
+                    "average_cpu_percent": metrics.average_cpu_percent,
+                    "requests_per_second": metrics.requests_per_second,
+                    "scale_up_threshold_cpu": settings.autoscaler_cpu_scale_up_threshold,
+                    "scale_up_threshold_rps": settings.autoscaler_rps_scale_up_threshold,
+                    "scale_down_threshold_cpu": settings.autoscaler_cpu_scale_down_threshold,
+                    "scale_down_threshold_rps": settings.autoscaler_rps_scale_down_threshold,
+                    "scale_up_candidate": scale_up,
+                    "scale_down_candidate": scale_down_candidate,
+                },
+            )
+        )
 
         if scale_up and current_replicas < spec.max_replicas:
             new_replica_count = min(current_replicas + 1, spec.max_replicas)
@@ -109,6 +128,8 @@ class Autoscaler:
                     "from_replicas": old_replica_count,
                     "to_replicas": new_replica_count,
                     "reason": reason,
+                    "average_cpu_percent": getattr(metrics, "average_cpu_percent", 0.0),
+                    "requests_per_second": getattr(metrics, "requests_per_second", 0.0),
                 },
             )
         )

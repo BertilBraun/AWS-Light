@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from aws_light.proxy.load_balancer import NoHealthyReplicaError, RoundRobinBalancer
@@ -61,6 +62,11 @@ _501_RESPONSE = (
     b'{"error": "transfer encoding unsupported"}'
 )
 
+_PROXY_METRIC_TOTAL = "proxy:requests:total"
+_PROXY_METRIC_BY_SERVICE = "proxy:requests:service"
+_PROXY_METRIC_BY_STATUS = "proxy:responses:status"
+_PROXY_METRIC_FAILURES = "proxy:failures"
+
 
 class ProxyServer:
     def __init__(
@@ -104,12 +110,14 @@ class ProxyServer:
         if _has_transfer_encoding(header_bytes):
             writer.write(_501_RESPONSE)
             await writer.drain()
+            await self._record_proxy_result(None, 501, "unsupported_transfer_encoding", 0.0)
             return
 
         content_length = _extract_request_content_length(header_bytes)
         if content_length is None:
             writer.write(_400_RESPONSE)
             await writer.drain()
+            await self._record_proxy_result(None, 400, "bad_content_length", 0.0)
             return
 
         body = body_prefix[:content_length]
@@ -122,12 +130,14 @@ class ProxyServer:
             except (asyncio.TimeoutError, asyncio.IncompleteReadError):
                 writer.write(_400_RESPONSE)
                 await writer.drain()
+                await self._record_proxy_result(None, 400, "incomplete_request_body", 0.0)
                 return
 
         service_name = _extract_service_name(header_bytes)
         if service_name is None:
             writer.write(_503_RESPONSE)
             await writer.drain()
+            await self._record_proxy_result(None, 503, "missing_host", 0.0)
             return
 
         try:
@@ -135,11 +145,13 @@ class ProxyServer:
         except NoHealthyReplicaError:
             writer.write(_503_RESPONSE)
             await writer.drain()
+            await self._record_proxy_result(service_name, 503, "no_healthy_replica", 0.0)
             return
 
         if self._redis is not None:
             await self._redis.incr(f"rps:{service_name}")
 
+        started = time.perf_counter()
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(endpoint.host, endpoint.port), timeout=5.0
@@ -147,6 +159,8 @@ class ProxyServer:
         except (OSError, asyncio.TimeoutError):
             writer.write(_502_RESPONSE)
             await writer.drain()
+            duration_ms = (time.perf_counter() - started) * 1000
+            await self._record_proxy_result(service_name, 502, "upstream_unreachable", duration_ms)
             return
 
         is_websocket = _is_websocket_upgrade(header_bytes)
@@ -164,10 +178,33 @@ class ProxyServer:
             )
         else:
             upstream_response = await _read_full_response(upstream_reader)
+            status_code = _extract_response_status(upstream_response) or 502
             writer.write(upstream_response)
             await writer.drain()
             upstream_writer.close()
             await upstream_writer.wait_closed()
+            duration_ms = (time.perf_counter() - started) * 1000
+            await self._record_proxy_result(service_name, status_code, None, duration_ms)
+
+    async def _record_proxy_result(
+        self,
+        service_name: str | None,
+        status_code: int,
+        failure_reason: str | None,
+        duration_ms: float,
+    ) -> None:
+        if self._redis is None:
+            return
+
+        pipe = self._redis.pipeline()
+        pipe.incr(_PROXY_METRIC_TOTAL)
+        pipe.hincrby(_PROXY_METRIC_BY_STATUS, str(status_code), 1)
+        if service_name:
+            pipe.hincrby(_PROXY_METRIC_BY_SERVICE, service_name, 1)
+            pipe.set(f"proxy:last_duration_ms:{service_name}", f"{duration_ms:.2f}")
+        if failure_reason:
+            pipe.hincrby(_PROXY_METRIC_FAILURES, failure_reason, 1)
+        await pipe.execute()
 
 
 async def _read_http_head(reader: asyncio.StreamReader) -> tuple[bytes, bytes]:
@@ -201,6 +238,17 @@ def _extract_service_name(header_bytes: bytes) -> str | None:
 
 def _is_websocket_upgrade(header_bytes: bytes) -> bool:
     return b"upgrade: websocket" in header_bytes.lower()
+
+
+def _extract_response_status(response_bytes: bytes) -> int | None:
+    status_line = response_bytes.split(b"\r\n", 1)[0]
+    parts = status_line.split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
 
 
 def _rewrite_request_headers(header_bytes: bytes, upstream_host: str, upstream_port: int) -> bytes:

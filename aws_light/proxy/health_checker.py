@@ -71,12 +71,24 @@ class HealthChecker:
         healthy = await _probe_http(url)
 
         if healthy:
+            had_failures = replica_id in self._consecutive_failures
             successes = self._consecutive_successes.get(replica_id, 0) + 1
             self._consecutive_successes[replica_id] = successes
-            self._consecutive_failures.pop(replica_id, None)
             if successes >= settings.health_check_success_threshold:
                 self._consecutive_successes.pop(replica_id, None)
+                self._consecutive_failures.pop(replica_id, None)
                 await self._routing_table.set_healthy(replica_id, True)
+                if had_failures:
+                    await self._event_bus.publish(
+                        WebSocketEvent(
+                            kind=EventKind.HEALTH_CHECK_RECOVERED,
+                            payload={
+                                "replica_id": replica_id,
+                                "service_name": service_name,
+                                "url": url,
+                            },
+                        )
+                    )
         else:
             failures = self._consecutive_failures.get(replica_id, 0) + 1
             self._consecutive_failures[replica_id] = failures
@@ -95,6 +107,7 @@ class HealthChecker:
                         payload={
                             "replica_id": replica_id,
                             "service_name": service_name,
+                            "url": url,
                             "consecutive_failures": failures,
                         },
                     )

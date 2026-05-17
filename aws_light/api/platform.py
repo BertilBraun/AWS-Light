@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from aws_light.compute.docker_client import DockerClient
 from aws_light.config import settings
-from aws_light.dependencies import get_event_bus
+from aws_light.dependencies import get_event_bus, get_redis_client
 from aws_light.iam.middleware import get_current_user, require_role
 from aws_light.models.iam import Role, UserSpec
 
@@ -102,6 +102,46 @@ async def get_platform_service_activity(
     return {"service": service_name, "activities": activities[:50]}
 
 
+@router.get("/metrics")
+async def get_platform_metrics(
+    _: UserSpec = require_role(Role.ADMIN),
+) -> dict[str, object]:
+    redis_client = get_redis_client()
+    total = await redis_client.get("proxy:requests:total")
+    by_service = await redis_client.hgetall("proxy:requests:service")
+    by_status = await redis_client.hgetall("proxy:responses:status")
+    failures = await redis_client.hgetall("proxy:failures")
+
+    return {
+        "proxy": {
+            "requests_total": _to_int(total),
+            "requests_by_service": _int_map(by_service),
+            "responses_by_status": _int_map(by_status),
+            "failures": _int_map(failures),
+        }
+    }
+
+
+@router.get("/events")
+async def get_platform_events(
+    limit: int = 100,
+    component: str | None = None,
+    service: str | None = None,
+    _: UserSpec = Depends(get_current_user),
+) -> dict[str, object]:
+    bounded_limit = max(1, min(limit, 500))
+    events = list(reversed(await get_event_bus().get_recent_events()))
+    filtered_events = [
+        event
+        for event in events
+        if _matches_event_filter(event, component=component, service=service)
+    ][:bounded_limit]
+    return {
+        "events": [event.model_dump(mode="json") for event in filtered_events],
+        "limit": bounded_limit,
+    }
+
+
 def _describe_platform_service(service_name: str) -> str:
     return {
         "control-plane": "REST API, dashboard, IaC, desired state writes",
@@ -136,10 +176,10 @@ def _event_to_activity(event: object) -> dict[str, object] | None:
 def _platform_service_for_event(kind: str) -> str | None:
     if kind in {"replica.started", "replica.stopped", "service.updated", "rollout.progress"}:
         return "orchestrator"
-    if kind == "health_check.failed":
-        return "health-checker"
-    if kind == "autoscale.triggered":
+    if kind in {"autoscale.evaluated", "autoscale.triggered"}:
         return "autoscaler"
+    if kind in {"health_check.failed", "health_check.recovered"}:
+        return "health-checker"
     if kind in {"secret.created", "bucket.created", "object.uploaded"}:
         return "control-plane"
     return None
@@ -171,6 +211,16 @@ def _summarize_activity(kind: str, payload: dict[str, object]) -> str:
             f"Scaled {payload.get('service_name')} from {payload.get('from_replicas')} "
             f"to {payload.get('to_replicas')} replicas"
         )
+    if kind == "autoscale.evaluated":
+        return (
+            f"Evaluated {payload.get('service_name')}: cpu="
+            f"{payload.get('average_cpu_percent')} rps={payload.get('requests_per_second')}"
+        )
+    if kind == "health_check.recovered":
+        return (
+            f"Recovered {payload.get('service_name')} "
+            f"replica {_short(payload.get('replica_id'))}"
+        )
     if kind == "rollout.progress":
         return (
             f"Rollout for {payload.get('service_name')} step {payload.get('step')}/"
@@ -190,3 +240,36 @@ def _summarize_activity(kind: str, payload: dict[str, object]) -> str:
 
 def _short(value: object) -> str:
     return str(value or "")[:8]
+
+
+def _to_int(value: object) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _int_map(values: dict[object, object]) -> dict[str, int]:
+    return {_decode_key(key): _to_int(value) for key, value in values.items()}
+
+
+def _decode_key(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def _matches_event_filter(
+    event: object,
+    *,
+    component: str | None,
+    service: str | None,
+) -> bool:
+    kind = getattr(event, "kind", "")
+    kind_value = getattr(kind, "value", str(kind))
+    payload = getattr(event, "payload", {})
+    if component is not None and _platform_service_for_event(kind_value) != component:
+        return False
+    return not (service is not None and payload.get("service_name") != service)

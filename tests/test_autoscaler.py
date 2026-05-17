@@ -82,6 +82,15 @@ async def test_scale_up_when_cpu_above_threshold(
     updated = await service_store.get("svc")
     assert updated is not None
     assert updated.spec.replicas == 3
+    events = await autoscaler._event_bus.get_recent_events()
+    assert [event.kind.value for event in events] == [
+        "autoscale.evaluated",
+        "autoscale.triggered",
+    ]
+    assert events[0].payload["scale_up_candidate"] is True
+    assert events[1].payload["average_cpu_percent"] == (
+        settings.autoscaler_cpu_scale_up_threshold + 1
+    )
 
 
 async def test_scale_up_clamps_at_max_replicas(

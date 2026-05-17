@@ -119,3 +119,57 @@ def test_introspection_requires_auth(client: TestClient) -> None:
     ]:
         response = client.get(path)
         assert response.status_code in {401, 403}
+
+
+async def _seed_platform_metrics_and_events() -> None:
+    redis = deps.get_redis_client()
+    redis.values["proxy:requests:total"] = "3"
+    redis.hashes["proxy:requests:service"] = {"hello-service": "3"}
+    redis.hashes["proxy:responses:status"] = {"200": "2", "502": "1"}
+    redis.hashes["proxy:failures"] = {"upstream_unreachable": "1"}
+    await deps.get_event_bus().publish(
+        WebSocketEvent(
+            kind=EventKind.AUTOSCALE_EVALUATED,
+            payload={
+                "service_name": "hello-service",
+                "current_replicas": 2,
+                "average_cpu_percent": 1.5,
+                "requests_per_second": 42.0,
+            },
+        )
+    )
+    await deps.get_event_bus().publish(
+        WebSocketEvent(
+            kind=EventKind.HEALTH_CHECK_FAILED,
+            payload={
+                "service_name": "other-service",
+                "replica_id": "replica-other",
+            },
+        )
+    )
+
+
+def test_platform_metrics_exposes_proxy_counters(client: TestClient) -> None:
+    client.portal.call(_seed_platform_metrics_and_events)
+    response = client.get("/api/v1/platform/metrics", headers=_auth_headers(client))
+
+    assert response.status_code == 200
+    assert response.json()["proxy"] == {
+        "requests_total": 3,
+        "requests_by_service": {"hello-service": 3},
+        "responses_by_status": {"200": 2, "502": 1},
+        "failures": {"upstream_unreachable": 1},
+    }
+
+
+def test_platform_events_can_filter_by_component_and_service(client: TestClient) -> None:
+    client.portal.call(_seed_platform_metrics_and_events)
+    response = client.get(
+        "/api/v1/platform/events?component=autoscaler&service=hello-service",
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert len(events) == 1
+    assert events[0]["kind"] == "autoscale.evaluated"

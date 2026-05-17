@@ -19,6 +19,7 @@ _storage_service: StorageService | None = None
 _presigned_service: PresignedUrlService | None = None
 _applier: Applier | None = None
 _event_bus: Any = None
+_redis_client: Any = None
 
 
 def get_service_store() -> Any:
@@ -64,3 +65,8 @@ def get_applier() -> Applier:
 def get_event_bus() -> Any:
     assert _event_bus is not None
     return _event_bus
+
+
+def get_redis_client() -> Any:
+    assert _redis_client is not None
+    return _redis_client

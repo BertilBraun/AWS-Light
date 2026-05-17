@@ -3,13 +3,49 @@ from __future__ import annotations
 import asyncio
 
 from aws_light.proxy.proxy_server import (
+    ProxyServer,
     _extract_request_content_length,
+    _extract_response_status,
     _has_transfer_encoding,
     _read_full_response,
     _read_http_head,
     _rewrite_request_headers,
     _rewrite_response_headers,
 )
+
+
+class FakeRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, int | str] = {}
+        self.hashes: dict[str, dict[str, int]] = {}
+
+    def pipeline(self) -> FakePipeline:
+        return FakePipeline(self)
+
+
+class FakePipeline:
+    def __init__(self, redis: FakeRedis) -> None:
+        self.redis = redis
+        self.commands: list[tuple[str, str, str | None, int | str]] = []
+
+    def incr(self, key: str) -> None:
+        self.commands.append(("incr", key, None, 1))
+
+    def hincrby(self, key: str, field: str, amount: int) -> None:
+        self.commands.append(("hincrby", key, field, amount))
+
+    def set(self, key: str, value: str) -> None:
+        self.commands.append(("set", key, None, value))
+
+    async def execute(self) -> None:
+        for command, key, field, value in self.commands:
+            if command == "incr":
+                self.redis.values[key] = self.redis.values.get(key, 0) + int(value)
+            elif command == "hincrby" and field is not None:
+                bucket = self.redis.hashes.setdefault(key, {})
+                bucket[field] = bucket.get(field, 0) + int(value)
+            elif command == "set":
+                self.redis.values[key] = str(value)
 
 
 def _reader_with(data: bytes) -> asyncio.StreamReader:
@@ -92,3 +128,22 @@ def test_request_content_length_parsing() -> None:
     bad_content_length = b"POST / HTTP/1.1\r\nContent-Length: bad\r\n\r\n"
     assert _extract_request_content_length(bad_content_length) is None
     assert _has_transfer_encoding(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+
+
+def test_extract_response_status() -> None:
+    assert _extract_response_status(b"HTTP/1.1 204 No Content\r\n\r\n") == 204
+    assert _extract_response_status(b"not-http\r\n\r\n") is None
+
+
+async def test_record_proxy_result_writes_redis_metrics() -> None:
+    redis = FakeRedis()
+    proxy = ProxyServer(balancer=None, port=8080, redis_client=redis)  # type: ignore[arg-type]
+
+    await proxy._record_proxy_result("hello-service", 200, None, 12.3)
+    await proxy._record_proxy_result("hello-service", 502, "upstream_unreachable", 4.0)
+
+    assert redis.values["proxy:requests:total"] == 2
+    assert redis.values["proxy:last_duration_ms:hello-service"] == "4.00"
+    assert redis.hashes["proxy:requests:service"] == {"hello-service": 2}
+    assert redis.hashes["proxy:responses:status"] == {"200": 1, "502": 1}
+    assert redis.hashes["proxy:failures"] == {"upstream_unreachable": 1}

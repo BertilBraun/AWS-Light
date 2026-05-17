@@ -33,6 +33,18 @@ _CONTROL_PLANE_SPEC.loader.exec_module(_CONTROL_PLANE_MODULE)
 create_app = _CONTROL_PLANE_MODULE.create_app
 
 
+class FakeRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        return self.hashes.get(key, {})
+
+
 @asynccontextmanager
 async def _minimal_lifespan(app: FastAPI) -> AsyncIterator[None]:
     config_module.settings.ensure_data_directories()
@@ -50,6 +62,7 @@ async def _minimal_lifespan(app: FastAPI) -> AsyncIterator[None]:
         base_url="http://testserver",
     )
     deps._event_bus = EventBus()
+    deps._redis_client = FakeRedis()
     admin_username = config_module.settings.default_admin_username
     if not await user_store.exists(admin_username):
         admin = make_default_admin()

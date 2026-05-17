@@ -84,6 +84,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     deps._presigned_service = presigned_service
     deps._applier = applier
     deps._event_bus = event_bus
+    deps._redis_client = redis_client
 
     await _seed_default_admin(user_store)
     logger.info("Control-plane ready on port %d", settings.api_port)
