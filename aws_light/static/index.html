@@ -13,6 +13,23 @@
   </header>
 
   <main>
+    <section id="platform-section">
+      <h2>Platform Services <span class="hint">click a row to inspect logs</span></h2>
+      <table id="platform-table">
+        <thead>
+          <tr>
+            <th>Service</th>
+            <th>Status</th>
+            <th>Health</th>
+            <th>Role</th>
+            <th>Ports</th>
+          </tr>
+        </thead>
+        <tbody id="platform-body"></tbody>
+      </table>
+      <div id="platform-detail-panel" hidden></div>
+    </section>
+
     <section id="nodes-section">
       <h2>Nodes</h2>
       <div id="node-grid"></div>

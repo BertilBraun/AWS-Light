@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
+from aws_light.dependencies import get_presigned_service, get_storage_service
 from aws_light.iam.middleware import get_current_user, require_role
 from aws_light.models.iam import Role, UserSpec
 from aws_light.models.storage import (
@@ -16,21 +17,9 @@ from aws_light.storage.storage_service import BucketNotFoundError, ObjectNotFoun
 router = APIRouter(prefix="/api/v1/storage", tags=["storage"])
 
 
-def _get_storage_service():  # type: ignore[no-untyped-def]
-    from aws_light.main import get_storage_service
-
-    return get_storage_service()
-
-
-def _get_presigned_service():  # type: ignore[no-untyped-def]
-    from aws_light.main import get_presigned_service
-
-    return get_presigned_service()
-
-
 @router.get("/buckets", response_model=list[Bucket])
 async def list_buckets(_: UserSpec = Depends(get_current_user)) -> list[Bucket]:
-    return _get_storage_service().list_buckets()
+    return get_storage_service().list_buckets()
 
 
 @router.post("/buckets", response_model=Bucket, status_code=status.HTTP_201_CREATED)
@@ -38,7 +27,7 @@ async def create_bucket(
     request: CreateBucketRequest,
     _: UserSpec = require_role(Role.DEVELOPER),
 ) -> Bucket:
-    storage = _get_storage_service()
+    storage = get_storage_service()
     if storage.bucket_exists(request.name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -53,7 +42,7 @@ async def delete_bucket(
     _: UserSpec = require_role(Role.DEVELOPER),
 ) -> None:
     try:
-        _get_storage_service().delete_bucket(bucket_name)
+        get_storage_service().delete_bucket(bucket_name)
     except BucketNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Bucket not found"
@@ -67,7 +56,7 @@ async def list_objects(
     _: UserSpec = Depends(get_current_user),
 ) -> list[ObjectMeta]:
     try:
-        return _get_storage_service().list_objects(bucket_name, prefix)
+        return get_storage_service().list_objects(bucket_name, prefix)
     except BucketNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Bucket not found"
@@ -88,7 +77,7 @@ async def put_object(
     data = await request.body()
     content_type = request.headers.get("content-type", "application/octet-stream")
     try:
-        return _get_storage_service().put_object(bucket_name, object_key, data, content_type)
+        return get_storage_service().put_object(bucket_name, object_key, data, content_type)
     except BucketNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Bucket not found"
@@ -102,7 +91,7 @@ async def get_object(
     _: UserSpec = Depends(get_current_user),
 ) -> Response:
     try:
-        data = _get_storage_service().get_object(bucket_name, object_key)
+        data = get_storage_service().get_object(bucket_name, object_key)
         return Response(content=data, media_type="application/octet-stream")
     except BucketNotFoundError:
         raise HTTPException(
@@ -124,7 +113,7 @@ async def delete_object(
     _: UserSpec = require_role(Role.DEVELOPER),
 ) -> None:
     try:
-        _get_storage_service().delete_object(bucket_name, object_key)
+        get_storage_service().delete_object(bucket_name, object_key)
     except (BucketNotFoundError, ObjectNotFoundError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Object not found"
@@ -141,14 +130,14 @@ async def presign_object(
     request: PresignRequest,
     _: UserSpec = require_role(Role.DEVELOPER),
 ) -> PresignedUrl:
-    storage = _get_storage_service()
+    storage = get_storage_service()
     if not storage.bucket_exists(bucket_name):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Bucket not found"
         ) from None
     if not storage.object_exists(bucket_name, object_key):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Object not found")
-    url = _get_presigned_service().generate_presigned_get(
+    url = get_presigned_service().generate_presigned_get(
         bucket_name, object_key, request.ttl_seconds
     )
     from datetime import datetime, timedelta, timezone
@@ -164,11 +153,11 @@ async def get_presigned_object(
     expires: str = Query(),
     signature: str = Query(),
 ) -> Response:
-    presigned_service = _get_presigned_service()
+    presigned_service = get_presigned_service()
     if not presigned_service.validate_presigned_url(bucket, key, expires, signature):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid or expired URL")
     try:
-        data = _get_storage_service().get_object(bucket, key)
+        data = get_storage_service().get_object(bucket, key)
         return Response(content=data, media_type="application/octet-stream")
     except (BucketNotFoundError, ObjectNotFoundError):
         raise HTTPException(

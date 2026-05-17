@@ -12,7 +12,6 @@ from aws_light.models.iam import (
     TokenResponse,
     UserSpec,
 )
-from aws_light.store.json_store import JsonStore
 
 router = APIRouter(prefix="/api/v1", tags=["iam"])
 
@@ -20,7 +19,7 @@ router = APIRouter(prefix="/api/v1", tags=["iam"])
 @router.post("/auth/login", response_model=TokenResponse)
 async def login(
     request: LoginRequest,
-    user_store: JsonStore[UserSpec] = Depends(get_user_store),
+    user_store=Depends(get_user_store),
 ) -> TokenResponse:
     user = await user_store.get(request.username)
     if user is None or not verify_password(request.password, user.password_hash):
@@ -39,7 +38,7 @@ async def get_me(current_user: UserSpec = Depends(get_current_user)) -> UserSpec
 @router.get("/users", response_model=list[UserSpec])
 async def list_users(
     _: UserSpec = require_role(Role.ADMIN),
-    user_store: JsonStore[UserSpec] = Depends(get_user_store),
+    user_store=Depends(get_user_store),
 ) -> list[UserSpec]:
     return await user_store.list()
 
@@ -48,7 +47,7 @@ async def list_users(
 async def create_user(
     request: CreateUserRequest,
     _: UserSpec = require_role(Role.ADMIN),
-    user_store: JsonStore[UserSpec] = Depends(get_user_store),
+    user_store=Depends(get_user_store),
 ) -> UserSpec:
     if await user_store.exists(request.username):
         raise HTTPException(
@@ -68,7 +67,7 @@ async def create_user(
 async def delete_user(
     username: str,
     current_user: UserSpec = require_role(Role.ADMIN),
-    user_store: JsonStore[UserSpec] = Depends(get_user_store),
+    user_store=Depends(get_user_store),
 ) -> None:
     if username == current_user.username:
         raise HTTPException(

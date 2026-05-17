@@ -8,11 +8,13 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI
 
 import aws_light.config as config_module
+import aws_light.dependencies as deps
 import aws_light.log as log
 from aws_light.api import deployments as deployments_router
 from aws_light.api import iac as iac_router
 from aws_light.api import iam as iam_router
 from aws_light.api import nodes as nodes_router
+from aws_light.api import platform as platform_router
 from aws_light.api import secrets as secrets_router
 from aws_light.api import services as services_router
 from aws_light.api import storage as storage_router
@@ -24,11 +26,12 @@ from aws_light.compute.node_manager import NodeManager
 from aws_light.compute.orchestrator import ComputeOrchestrator
 from aws_light.compute.scheduler import BinPackScheduler
 from aws_light.dashboard.event_bus import EventBus
-from aws_light.dependencies import get_user_store
 from aws_light.iac.applier import Applier
 from aws_light.iac.differ import Differ
 from aws_light.iam.auth import make_default_admin
 from aws_light.models.deployment import RolloutState
+from aws_light.models.iam import UserSpec
+from aws_light.models.node import NodeState
 from aws_light.models.secret import SecretSpec
 from aws_light.models.service import ServiceState
 from aws_light.proxy.health_checker import HealthChecker
@@ -40,156 +43,104 @@ from aws_light.storage.presigned import PresignedUrlService
 from aws_light.storage.storage_service import StorageService
 from aws_light.store.json_store import JsonStore
 
-_service_store: JsonStore[ServiceState] | None = None
-_deployment_store: JsonStore[RolloutState] | None = None
-_node_manager: NodeManager | None = None
-_orchestrator: ComputeOrchestrator | None = None
-_routing_table: RoutingTable | None = None
-_proxy_server: ProxyServer | None = None
-_health_checker: HealthChecker | None = None
-_event_bus: EventBus | None = None
-_autoscaler: Autoscaler | None = None
-_secrets_manager: SecretsManager | None = None
-_storage_service: StorageService | None = None
-_presigned_service: PresignedUrlService | None = None
-_applier: Applier | None = None
-
-
-def get_service_store() -> JsonStore[ServiceState]:
-    assert _service_store is not None
-    return _service_store
-
-
-def get_deployment_store() -> JsonStore[RolloutState]:
-    assert _deployment_store is not None
-    return _deployment_store
-
-
-def get_node_manager() -> NodeManager:
-    assert _node_manager is not None
-    return _node_manager
-
-
-def get_orchestrator() -> ComputeOrchestrator:
-    assert _orchestrator is not None
-    return _orchestrator
-
-
-def get_routing_table() -> RoutingTable:
-    assert _routing_table is not None
-    return _routing_table
-
-
-def get_event_bus() -> EventBus:
-    assert _event_bus is not None
-    return _event_bus
-
-
-def get_secrets_manager() -> SecretsManager:
-    assert _secrets_manager is not None
-    return _secrets_manager
-
-
-def get_storage_service() -> StorageService:
-    assert _storage_service is not None
-    return _storage_service
-
-
-def get_presigned_service() -> PresignedUrlService:
-    assert _presigned_service is not None
-    return _presigned_service
-
-
-def get_applier() -> Applier:
-    assert _applier is not None
-    return _applier
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _service_store, _deployment_store, _node_manager, _orchestrator
-    global _routing_table, _proxy_server, _health_checker, _event_bus
-    global _autoscaler, _secrets_manager, _storage_service, _presigned_service, _applier
-
-    log.configure("control-plane")
+    log.configure("monolith")
     settings = config_module.settings
     settings.ensure_data_directories()
-    await _seed_default_admin()
 
     redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
 
-    _event_bus = EventBus()
-    _service_store = JsonStore(settings.data_directory / "services.json", ServiceState)
-    _deployment_store = JsonStore(settings.data_directory / "deployments.json", RolloutState)
-    _node_manager = NodeManager()
-    _routing_table = RoutingTable()
-
+    event_bus = EventBus()
+    service_store: JsonStore[ServiceState] = JsonStore(
+        settings.data_directory / "services.json", ServiceState
+    )
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        settings.data_directory / "deployments.json", RolloutState
+    )
+    node_store: JsonStore[NodeState] = JsonStore(settings.data_directory / "nodes.json", NodeState)
+    user_store: JsonStore[UserSpec] = JsonStore(settings.data_directory / "users.json", UserSpec)
     secret_store: JsonStore[SecretSpec] = JsonStore(
         settings.data_directory / "secrets.json", SecretSpec
     )
-    _secrets_manager = SecretsManager(secret_store=secret_store)
-    _storage_service = StorageService(storage_root=settings.data_directory / "storage")
-    _presigned_service = PresignedUrlService(
+
+    node_manager = NodeManager()
+    routing_table = RoutingTable()
+    secrets_manager = SecretsManager(secret_store=secret_store)
+    storage_service = StorageService(storage_root=settings.data_directory / "storage")
+    presigned_service = PresignedUrlService(
         secret_key=settings.jwt_secret,
         base_url=f"http://localhost:{settings.api_port}",
     )
-    _applier = Applier(
-        service_store=_service_store,
-        secrets_manager=_secrets_manager,
-        storage_service=_storage_service,
+    applier = Applier(
+        service_store=service_store,
+        secrets_manager=secrets_manager,
+        storage_service=storage_service,
         differ=Differ(),
-        event_bus=_event_bus,
+        event_bus=event_bus,
     )
+
+    # Register into the shared dependency registry used by all API routes.
+    deps._service_store = service_store
+    deps._deployment_store = deployment_store
+    deps._node_store = node_store
+    deps._user_store = user_store
+    deps._secrets_manager = secrets_manager
+    deps._storage_service = storage_service
+    deps._presigned_service = presigned_service
+    deps._applier = applier
+    deps._event_bus = event_bus
+
+    await _seed_default_admin(user_store, settings)
 
     docker_client = DockerClient()
-    scheduler = BinPackScheduler()
-    _orchestrator = ComputeOrchestrator(
-        service_store=_service_store,
-        deployment_store=_deployment_store,
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
         docker_client=docker_client,
-        node_manager=_node_manager,
-        scheduler=scheduler,
-        event_bus=_event_bus,
-        routing_table=_routing_table,
-        secrets_manager=_secrets_manager,
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,
+        routing_table=routing_table,
+        secrets_manager=secrets_manager,
         redis_client=redis_client,
+        node_store=node_store,
     )
 
-    balancer = RoundRobinBalancer(_routing_table)
-    _proxy_server = ProxyServer(
+    balancer = RoundRobinBalancer(routing_table)
+    proxy_server = ProxyServer(
         balancer=balancer, port=settings.proxy_port, redis_client=redis_client
     )
-    _health_checker = HealthChecker(
-        routing_table=_routing_table,
-        service_store=_service_store,
-        event_bus=_event_bus,
+    health_checker = HealthChecker(
+        routing_table=routing_table,
+        service_store=service_store,
+        event_bus=event_bus,
     )
-
     metrics_collector = MetricsCollector(redis_client=redis_client)
-    _autoscaler = Autoscaler(
-        service_store=_service_store,
+    autoscaler = Autoscaler(
+        service_store=service_store,
         metrics_collector=metrics_collector,
-        event_bus=_event_bus,
+        event_bus=event_bus,
     )
 
-    await _orchestrator.start()
-    await _health_checker.start()
-    await _proxy_server.start()
-    await _autoscaler.start()
+    await orchestrator.start()
+    await health_checker.start()
+    await proxy_server.start()
+    await autoscaler.start()
 
     yield
 
-    await _autoscaler.stop()
-    await _proxy_server.stop()
-    await _health_checker.stop()
-    await _orchestrator.stop()
+    await autoscaler.stop()
+    await proxy_server.stop()
+    await health_checker.stop()
+    await orchestrator.stop()
     await redis_client.aclose()
 
 
-async def _seed_default_admin() -> None:
-    user_store = get_user_store()
-    settings = config_module.settings
-    if not await user_store.exists(settings.default_admin_username):
+async def _seed_default_admin(user_store: JsonStore[UserSpec], settings: object) -> None:
+    username = getattr(settings, "default_admin_username", "admin")
+    if not await user_store.exists(username):
         admin = make_default_admin()
         await user_store.put(admin.username, admin)
 
@@ -200,6 +151,7 @@ def create_app(lifespan_override: object = None) -> FastAPI:
     app.include_router(iam_router.router)
     app.include_router(services_router.router)
     app.include_router(nodes_router.router)
+    app.include_router(platform_router.router)
     app.include_router(deployments_router.router)
     app.include_router(secrets_router.router)
     app.include_router(storage_router.router)

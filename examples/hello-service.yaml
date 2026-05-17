@@ -10,8 +10,8 @@ metadata:
   name: hello-service
 spec:
   image: aws-light/hello-service:latest
-  replicas: 1
-  minReplicas: 1
+  replicas: 2
+  minReplicas: 2
   maxReplicas: 3
   cpuRequest: 0.1
   memoryRequestMb: 64

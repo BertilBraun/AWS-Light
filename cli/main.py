@@ -133,9 +133,7 @@ def diff(file_path: str) -> None:
     table.add_column('Action')
     table.add_column('Changed Fields')
     for manifest_diff in diffs:
-        action_color = {'create': 'green', 'update': 'yellow', 'none': 'dim'}.get(
-            manifest_diff['action'], 'white'
-        )
+        action_color = {'create': 'green', 'update': 'yellow', 'none': 'dim'}.get(manifest_diff['action'], 'white')
         table.add_row(
             manifest_diff['kind'],
             manifest_diff['name'],
@@ -174,9 +172,7 @@ def status(service_name: str | None) -> None:
         table.add_column('Status')
         table.add_column('Replicas')
         for service in services:
-            status_color = {'running': 'green', 'degraded': 'yellow', 'failed': 'red'}.get(
-                service['status'], 'white'
-            )
+            status_color = {'running': 'green', 'degraded': 'yellow', 'failed': 'red'}.get(service['status'], 'white')
             table.add_row(
                 service['spec']['name'],
                 service['spec']['image'],
@@ -192,9 +188,7 @@ def _print_service(service: dict) -> None:  # type: ignore[type-arg]
     console.print(f'  image: {spec["image"]}')
     console.print(f'  replicas: {len(service["replicas"])}/{spec["replicas"]}')
     for replica in service['replicas']:
-        console.print(
-            f'    [{replica["status"]}] {replica["replica_id"][:12]}  port={replica["host_port"]}'
-        )
+        console.print(f'    [{replica["status"]}] {replica["replica_id"][:12]}  port={replica["host_port"]}')
 
 
 @cli.group()
@@ -286,7 +280,7 @@ def storage_rm(uri: str) -> None:
 def _parse_s3_uri(uri: str) -> tuple[str, str]:
     without_scheme = uri.removeprefix('s3://')
     parts = without_scheme.split('/', 1)
-    if len(parts) < 2:
+    if len(parts) != 2:
         console.print(f'[red]Invalid s3:// URI: {uri}[/red]')
         sys.exit(1)
     return parts[0], parts[1]

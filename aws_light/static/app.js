@@ -2,6 +2,8 @@
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const nodeGrid        = document.getElementById('node-grid');
+const platformBody    = document.getElementById('platform-body');
+const platformDetailPanel = document.getElementById('platform-detail-panel');
 const servicesBody    = document.getElementById('services-body');
 const detailPanel     = document.getElementById('detail-panel');
 const secretsList     = document.getElementById('secrets-list');
@@ -11,6 +13,8 @@ const connectionStatus= document.getElementById('connection-status');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const nodeCards   = {};  // node_id  -> <div> card element
+const platformRows = {}; // platform service -> <tr> element
+const platformData = {}; // platform service -> service object
 const serviceRows = {};  // svc name -> <tr> element
 const serviceData = {};  // svc name -> full service object (from snapshot/events)
 let selectedService = null;
@@ -51,11 +55,144 @@ function applySnapshot(snapshot) {
   Object.keys(serviceRows).forEach(k => delete serviceRows[k]);
   Object.keys(serviceData).forEach(k => delete serviceData[k]);
 
-  (snapshot.nodes    || []).forEach(renderNode);
+  (snapshot.nodes    || [])
+    .slice()
+    .sort((a, b) => a.spec.node_id.localeCompare(b.spec.node_id))
+    .forEach(renderNode);
   (snapshot.services || []).forEach(svc => { serviceData[svc.spec.name] = svc; renderService(svc); });
   (snapshot.secrets  || []).forEach(renderSecret);
   (snapshot.buckets  || []).forEach(renderBucket);
   (snapshot.events   || []).slice(-50).forEach(appendEvent);
+}
+
+// Platform services -----------------------------------------------------------
+async function loadPlatformServices() {
+  try {
+    const response = await fetch('/api/v1/platform/services');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    renderPlatformServices(await response.json());
+  } catch (error) {
+    platformBody.innerHTML = `
+      <tr><td colspan="5" class="muted small">Could not load platform services: ${escapeHtml(error.message)}</td></tr>
+    `;
+  }
+}
+
+function renderPlatformServices(services) {
+  platformBody.innerHTML = '';
+  Object.keys(platformRows).forEach(k => delete platformRows[k]);
+  Object.keys(platformData).forEach(k => delete platformData[k]);
+
+  services.forEach(service => {
+    platformData[service.service] = service;
+    const row = document.createElement('tr');
+    row.className = 'platform-row';
+    row.innerHTML = `
+      <td class="mono">${escapeHtml(service.service)}</td>
+      <td><span class="badge ${statusClass(service.status)}">${escapeHtml(service.status || 'unknown')}</span></td>
+      <td><span class="badge ${healthClass(service.health)}">${escapeHtml(service.health || '-')}</span></td>
+      <td class="muted small">${escapeHtml(service.role || '')}</td>
+      <td class="muted small">${escapeHtml((service.ports || []).join(', ') || '-')}</td>
+    `;
+    row.addEventListener('click', () => showPlatformDetail(service.service));
+    platformBody.appendChild(row);
+    platformRows[service.service] = row;
+  });
+}
+
+function showPlatformDetail(serviceName) {
+  const service = platformData[serviceName];
+  if (!service) return;
+  Object.values(platformRows).forEach(r => r.classList.remove('selected'));
+  platformRows[serviceName]?.classList.add('selected');
+  platformDetailPanel.hidden = false;
+  platformDetailPanel.innerHTML = `
+    <div class="detail-header">
+      <strong>${escapeHtml(service.service)}</strong>
+      <span class="muted small">${escapeHtml(service.container_name || '')}</span>
+      <button class="logs-btn" onclick="loadPlatformActivity('${service.service}')">Activity</button>
+      <button class="logs-btn" onclick="loadPlatformLogs('${service.service}')">Logs</button>
+      <button class="close-btn" onclick="closePlatformDetail()">&#x2715;</button>
+    </div>
+    <div class="detail-meta">
+      <span>Status: ${escapeHtml(service.status || 'unknown')}</span>
+      <span>Health: ${escapeHtml(service.health || '-')}</span>
+      <span>Image: ${escapeHtml(service.image || '-')}</span>
+    </div>
+    <div id="platform-logs-panel" class="logs-panel" hidden></div>
+  `;
+}
+
+function closePlatformDetail() {
+  platformDetailPanel.hidden = true;
+  Object.values(platformRows).forEach(r => r.classList.remove('selected'));
+}
+
+window.closePlatformDetail = closePlatformDetail;
+
+async function loadPlatformActivity(serviceName) {
+  const panel = document.getElementById('platform-logs-panel');
+  if (!panel) return;
+  panel.hidden = false;
+  panel.innerHTML = '<div class="logs-loading">Loading activity...</div>';
+
+  try {
+    const response = await fetch(`/api/v1/platform/services/${encodeURIComponent(serviceName)}/activity`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const activities = data.activities || [];
+    const rows = activities.map(activity => `
+      <li>
+        <span class="event-time">${new Date(activity.timestamp).toLocaleTimeString()}</span>
+        <span class="event-kind">${escapeHtml(activity.kind)}</span>
+        <span class="event-detail">${escapeHtml(activity.summary)}</span>
+      </li>
+    `).join('');
+    panel.innerHTML = `
+      <div class="log-block">
+        <div class="log-title">${escapeHtml(serviceName)} activity</div>
+        <ul class="activity-list">${rows || '<li class="logs-loading">No recent activity.</li>'}</ul>
+      </div>
+    `;
+  } catch (error) {
+    panel.innerHTML = `<div class="logs-error">Could not load activity: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+window.loadPlatformActivity = loadPlatformActivity;
+
+async function loadPlatformLogs(serviceName) {
+  const panel = document.getElementById('platform-logs-panel');
+  if (!panel) return;
+  panel.hidden = false;
+  panel.innerHTML = '<div class="logs-loading">Loading logs...</div>';
+
+  try {
+    const response = await fetch(`/api/v1/platform/services/${encodeURIComponent(serviceName)}/logs?tail=160`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    panel.innerHTML = `
+      <div class="log-block">
+        <div class="log-title">${escapeHtml(data.container_name || serviceName)}</div>
+        <pre>${escapeHtml(reverseLogLines(data.logs) || 'No logs yet.')}</pre>
+      </div>
+    `;
+  } catch (error) {
+    panel.innerHTML = `<div class="logs-error">Could not load logs: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+window.loadPlatformLogs = loadPlatformLogs;
+
+function statusClass(status) {
+  return status === 'running' ? 'running' : 'stopped';
+}
+
+function healthClass(health) {
+  if (health === 'healthy') return 'running';
+  if (health === 'unhealthy') return 'failed';
+  if (health === 'starting') return 'pending';
+  return 'stopped';
 }
 
 // ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -155,7 +292,7 @@ function renderDetailPanel(svc) {
     <tr>
       <td class="mono">${r.replica_id.slice(0, 8)}</td>
       <td>${r.node_id}</td>
-      <td>:${r.host_port}</td>
+      <td class="mono">${r.container_ip || '-'}:${svc.spec.port}</td>
       <td><span class="badge ${r.status}">${r.status}</span></td>
     </tr>
   `).join('');
@@ -168,6 +305,7 @@ function renderDetailPanel(svc) {
     <div class="detail-header">
       <strong>${svc.spec.name}</strong>
       <span class="muted small">${svc.spec.image}</span>
+      <button class="logs-btn" onclick="loadServiceLogs('${svc.spec.name}')">Logs</button>
       <button class="close-btn" onclick="closeDetail()">&#x2715;</button>
     </div>
     <div class="detail-meta">
@@ -178,10 +316,53 @@ function renderDetailPanel(svc) {
       ${secretPill}
     </div>
     <table class="replica-table">
-      <thead><tr><th>ID</th><th>Node</th><th>Port</th><th>Status</th></tr></thead>
+      <thead><tr><th>ID</th><th>Node</th><th>Endpoint</th><th>Status</th></tr></thead>
       <tbody>${replicaRows || '<tr><td colspan="4" class="muted small" style="padding:10px 14px">No replicas yet</td></tr>'}</tbody>
     </table>
+    <div id="logs-panel" class="logs-panel" hidden></div>
   `;
+}
+
+async function loadServiceLogs(serviceName) {
+  const panel = document.getElementById('logs-panel');
+  if (!panel) return;
+
+  panel.hidden = false;
+  panel.innerHTML = '<div class="logs-loading">Loading logs...</div>';
+
+  try {
+    const response = await fetch(`/api/v1/services/${encodeURIComponent(serviceName)}/logs?tail=120`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const blocks = (data.replicas || []).map(replica => `
+      <div class="log-block">
+        <div class="log-title">replica ${escapeHtml(replica.replica_id.slice(0, 8))} · ${escapeHtml(replica.node_id)}</div>
+        <pre>${escapeHtml(reverseLogLines(replica.logs) || 'No logs yet.')}</pre>
+      </div>
+    `).join('');
+    panel.innerHTML = blocks || '<div class="logs-loading">No replicas.</div>';
+  } catch (error) {
+    panel.innerHTML = `<div class="logs-error">Could not load logs: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+window.loadServiceLogs = loadServiceLogs;
+
+function reverseLogLines(logs) {
+  return String(logs || '')
+    .split('\n')
+    .filter(line => line.length > 0)
+    .reverse()
+    .join('\n');
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
 }
 
 // ── Secrets ───────────────────────────────────────────────────────────────────
@@ -229,7 +410,7 @@ function handleEvent(event) {
         svc.replicas.push({
           replica_id: payload.replica_id,
           node_id:    payload.node_id,
-          host_port:  payload.host_port,
+          container_ip: payload.container_ip,
           status:     'running',
           container_id: '',
           cpu_percent:  0,
@@ -295,7 +476,7 @@ function summarisePayload(kind, payload) {
     case 'service.updated':
       return `${payload.service_name} → ${payload.status} (${payload.replica_count} replicas)`;
     case 'replica.started':
-      return `${payload.service_name} r/${payload.replica_id?.slice(0, 8)} on ${payload.node_id} :${payload.host_port}`;
+      return `${payload.service_name} r/${payload.replica_id?.slice(0, 8)} on ${payload.node_id} ${payload.container_ip || ''}`;
     case 'replica.stopped':
       return `${payload.service_name} r/${payload.replica_id?.slice(0, 8)}`;
     case 'replica.failed':
@@ -320,3 +501,5 @@ function summarisePayload(kind, payload) {
 }
 
 connect();
+loadPlatformServices();
+setInterval(loadPlatformServices, 5000);

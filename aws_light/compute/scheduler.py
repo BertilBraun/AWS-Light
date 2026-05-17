@@ -23,5 +23,13 @@ class BinPackScheduler:
             raise SchedulingError(
                 f"No node can fit request: cpu={cpu_request}, memory={memory_request_mb}mb"
             )
-        # Bin-pack: prefer the node with the least available capacity (most full)
-        return min(candidates, key=lambda node: node.available_cpu)
+        # Spread replicas across nodes so placement is visible and easy to inspect.
+        return min(
+            candidates,
+            key=lambda node: (
+                len(node.replica_ids),
+                node.usage.cpu_used,
+                node.usage.memory_used_mb,
+                node.spec.node_id,
+            ),
+        )

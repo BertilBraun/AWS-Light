@@ -13,8 +13,9 @@ from aws_light.compute.node_manager import NodeManager
 from aws_light.compute.orchestrator import ComputeOrchestrator
 from aws_light.compute.scheduler import BinPackScheduler
 from aws_light.config import settings
-from aws_light.dashboard.event_bus import EventBus
+from aws_light.events.redis_event_bus import RedisEventBus
 from aws_light.models.deployment import RolloutState
+from aws_light.models.node import NodeState
 from aws_light.models.secret import SecretSpec
 from aws_light.models.service import ServiceState
 from aws_light.proxy.redis_routing_table import RedisRoutingTable
@@ -39,11 +40,15 @@ async def main() -> None:
 
     pool = await asyncpg.create_pool(settings.database_url, min_size=2, max_size=5)
     redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
-    event_bus = EventBus()
+    event_bus = RedisEventBus(redis_client)
 
     service_store: PostgresStore[ServiceState] = PostgresStore(pool, "services", ServiceState)
     deployment_store: PostgresStore[RolloutState] = PostgresStore(pool, "deployments", RolloutState)
     secret_store: PostgresStore[SecretSpec] = PostgresStore(pool, "secrets", SecretSpec)
+    node_store: PostgresStore[NodeState] = PostgresStore(pool, "nodes", NodeState)
+
+    for store in [service_store, deployment_store, secret_store, node_store]:
+        await store.create_table()
 
     routing_table = RedisRoutingTable(redis_client)
     secrets_manager = SecretsManager(secret_store=secret_store)
@@ -60,6 +65,7 @@ async def main() -> None:
         routing_table=routing_table,
         secrets_manager=secrets_manager,
         redis_client=redis_client,
+        node_store=node_store,
     )
 
     await orchestrator.start()

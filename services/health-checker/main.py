@@ -26,6 +26,7 @@ async def main() -> None:
     routing_table = RedisRoutingTable(redis_client)
     event_bus = RedisEventBus(redis_client)
     service_store: PostgresStore[ServiceState] = PostgresStore(pool, "services", ServiceState)
+    await service_store.create_table()
 
     checker = HealthChecker(
         routing_table=routing_table,

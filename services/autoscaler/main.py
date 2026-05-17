@@ -24,6 +24,8 @@ async def main() -> None:
     redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
 
     service_store: PostgresStore[ServiceState] = PostgresStore(pool, "services", ServiceState)
+    await service_store.create_table()
+
     event_bus = RedisEventBus(redis_client)
     metrics_collector = MetricsCollector(redis_client=redis_client)
 

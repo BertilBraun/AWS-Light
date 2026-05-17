@@ -11,6 +11,7 @@ class ResourceStatus(str, Enum):
     DEGRADED = "degraded"
     STOPPED = "stopped"
     FAILED = "failed"
+    DELETING = "deleting"
 
 
 class ResourceTimestamps:

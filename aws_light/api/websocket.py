@@ -4,37 +4,37 @@ import asyncio
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from aws_light.dependencies import (
+    get_event_bus,
+    get_node_store,
+    get_secrets_manager,
+    get_service_store,
+    get_storage_service,
+)
+
 router = APIRouter(tags=["dashboard"])
 
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    from aws_light.main import (
-        get_event_bus,
-        get_node_manager,
-        get_secrets_manager,
-        get_service_store,
-        get_storage_service,
-    )
-
     await websocket.accept()
 
     event_bus = get_event_bus()
     service_store = get_service_store()
-    node_manager = get_node_manager()
+    node_store = get_node_store()
     secrets_manager = get_secrets_manager()
     storage_service = get_storage_service()
 
     services = await service_store.list()
-    nodes = node_manager.get_all_nodes()
+    nodes = await node_store.list()
     secret_names = await secrets_manager.list_secret_names()
     buckets = storage_service.list_buckets()
-    recent_events = event_bus.get_recent_events()
+    recent_events = await event_bus.get_recent_events()
 
     snapshot = {
         "kind": "snapshot",
-        "services": [service.model_dump(mode="json") for service in services],
         "nodes": [node.model_dump(mode="json") for node in nodes],
+        "services": [service.model_dump(mode="json") for service in services],
         "secrets": secret_names,
         "buckets": [bucket.model_dump(mode="json") for bucket in buckets],
         "events": [event.model_dump(mode="json") for event in recent_events],

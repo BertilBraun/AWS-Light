@@ -11,11 +11,13 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import aws_light.dependencies as deps
 import aws_light.log as log
 from aws_light.api import deployments as deployments_router
 from aws_light.api import iac as iac_router
 from aws_light.api import iam as iam_router
 from aws_light.api import nodes as nodes_router
+from aws_light.api import platform as platform_router
 from aws_light.api import secrets as secrets_router
 from aws_light.api import services as services_router
 from aws_light.api import storage as storage_router
@@ -26,6 +28,8 @@ from aws_light.iac.applier import Applier
 from aws_light.iac.differ import Differ
 from aws_light.iam.auth import make_default_admin
 from aws_light.models.deployment import RolloutState
+from aws_light.models.iam import UserSpec
+from aws_light.models.node import NodeState
 from aws_light.models.secret import SecretSpec
 from aws_light.models.service import ServiceState
 from aws_light.secrets.secrets_manager import SecretsManager
@@ -35,100 +39,60 @@ from aws_light.store.postgres_store import PostgresStore
 
 logger = logging.getLogger(__name__)
 
-_pool: asyncpg.Pool | None = None
-_redis: aioredis.Redis | None = None
-_service_store: PostgresStore[ServiceState] | None = None
-_deployment_store: PostgresStore[RolloutState] | None = None
-_secrets_manager: SecretsManager | None = None
-_storage_service: StorageService | None = None
-_presigned_service: PresignedUrlService | None = None
-_applier: Applier | None = None
-_event_bus: RedisEventBus | None = None
-
-
-def get_service_store() -> PostgresStore[ServiceState]:
-    assert _service_store is not None
-    return _service_store
-
-
-def get_deployment_store() -> PostgresStore[RolloutState]:
-    assert _deployment_store is not None
-    return _deployment_store
-
-
-def get_secrets_manager() -> SecretsManager:
-    assert _secrets_manager is not None
-    return _secrets_manager
-
-
-def get_storage_service() -> StorageService:
-    assert _storage_service is not None
-    return _storage_service
-
-
-def get_presigned_service() -> PresignedUrlService:
-    assert _presigned_service is not None
-    return _presigned_service
-
-
-def get_applier() -> Applier:
-    assert _applier is not None
-    return _applier
-
-
-def get_event_bus() -> RedisEventBus:
-    assert _event_bus is not None
-    return _event_bus
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _pool, _redis, _service_store, _deployment_store
-    global _secrets_manager, _storage_service, _presigned_service, _applier, _event_bus
-
     log.configure("control-plane")
     settings.ensure_data_directories()
 
-    _pool = await asyncpg.create_pool(settings.database_url, min_size=2, max_size=10)
-    _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
-    _event_bus = RedisEventBus(_redis)
+    pool = await asyncpg.create_pool(settings.database_url, min_size=2, max_size=10)
+    redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+    event_bus = RedisEventBus(redis_client)
 
-    _service_store = PostgresStore(_pool, "services", ServiceState)
-    _deployment_store = PostgresStore(_pool, "deployments", RolloutState)
-    secret_pg_store: PostgresStore[SecretSpec] = PostgresStore(_pool, "secrets", SecretSpec)
+    service_store: PostgresStore[ServiceState] = PostgresStore(pool, "services", ServiceState)
+    deployment_store: PostgresStore[RolloutState] = PostgresStore(pool, "deployments", RolloutState)
+    node_store: PostgresStore[NodeState] = PostgresStore(pool, "nodes", NodeState)
+    secret_pg_store: PostgresStore[SecretSpec] = PostgresStore(pool, "secrets", SecretSpec)
+    user_store: PostgresStore[UserSpec] = PostgresStore(pool, "users", UserSpec)
 
-    for store in [_service_store, _deployment_store, secret_pg_store]:
+    for store in [service_store, deployment_store, node_store, secret_pg_store, user_store]:
         await store.create_table()
 
-    _secrets_manager = SecretsManager(secret_store=secret_pg_store)
-    _storage_service = StorageService(storage_root=settings.data_directory / "storage")
-    _presigned_service = PresignedUrlService(
+    secrets_manager = SecretsManager(secret_store=secret_pg_store)
+    storage_service = StorageService(storage_root=settings.data_directory / "storage")
+    presigned_service = PresignedUrlService(
         secret_key=settings.jwt_secret,
         base_url=f"http://localhost:{settings.api_port}",
     )
-    _applier = Applier(
-        service_store=_service_store,
-        secrets_manager=_secrets_manager,
-        storage_service=_storage_service,
+    applier = Applier(
+        service_store=service_store,
+        secrets_manager=secrets_manager,
+        storage_service=storage_service,
         differ=Differ(),
-        event_bus=_event_bus,
+        event_bus=event_bus,
     )
 
-    await _seed_default_admin()
+    # Register into the shared dependency registry used by all API routes.
+    deps._service_store = service_store
+    deps._deployment_store = deployment_store
+    deps._node_store = node_store
+    deps._user_store = user_store
+    deps._secrets_manager = secrets_manager
+    deps._storage_service = storage_service
+    deps._presigned_service = presigned_service
+    deps._applier = applier
+    deps._event_bus = event_bus
+
+    await _seed_default_admin(user_store)
     logger.info("Control-plane ready on port %d", settings.api_port)
 
     yield
 
-    await _redis.aclose()
-    await _pool.close()
+    await redis_client.aclose()
+    await pool.close()
 
 
-async def _seed_default_admin() -> None:
-    from aws_light.models.iam import UserSpec
-    from aws_light.store.postgres_store import PostgresStore as PG
-
-    user_store: PG[UserSpec] = PostgresStore(_pool, "users", UserSpec)  # type: ignore[arg-type]
-    await user_store.create_table()
+async def _seed_default_admin(user_store: PostgresStore[UserSpec]) -> None:
     if not await user_store.exists(settings.default_admin_username):
         admin = make_default_admin()
         await user_store.put(admin.username, admin)
@@ -144,13 +108,14 @@ def create_app() -> FastAPI:
     app.include_router(iam_router.router)
     app.include_router(services_router.router)
     app.include_router(nodes_router.router)
+    app.include_router(platform_router.router)
     app.include_router(deployments_router.router)
     app.include_router(secrets_router.router)
     app.include_router(storage_router.router)
     app.include_router(iac_router.router)
     app.include_router(websocket_router.router)
 
-    static_path = Path(__file__).parent.parent.parent / "aws_light" / "static"
+    static_path = Path(deps.__file__).parent / "static"
     if static_path.exists():
         app.mount("/static", StaticFiles(directory=static_path), name="static")
 

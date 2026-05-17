@@ -45,12 +45,13 @@ services:
     ports: ["8000:8000"]
     volumes:
       - storage-data:/app/data/storage
+      - /var/run/docker.sock:/var/run/docker.sock
     env_file: .env
     depends_on:
       postgres: { condition: service_healthy }
       redis:    { condition: service_healthy }
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/healthz || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=2).read()\""]
       interval: 3s
       timeout: 5s
       retries: 10
@@ -64,8 +65,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     env_file: .env
     depends_on:
-      postgres: { condition: service_healthy }
-      redis:    { condition: service_healthy }
+      postgres:      { condition: service_healthy }
+      redis:         { condition: service_healthy }
+      control-plane: { condition: service_healthy }
     # Writes /app/healthy after creating aws-light-data network so that the
     # proxy and health-checker don't try to join the network before it exists.
     healthcheck:
@@ -92,9 +94,10 @@ services:
     networks: [internal, data]
     env_file: .env
     depends_on:
-      postgres:     { condition: service_healthy }
-      redis:        { condition: service_healthy }
-      orchestrator: { condition: service_healthy }
+      postgres:      { condition: service_healthy }
+      redis:         { condition: service_healthy }
+      control-plane: { condition: service_healthy }
+      orchestrator:  { condition: service_healthy }
 
   autoscaler:
     build:
@@ -103,5 +106,6 @@ services:
     networks: [internal]
     env_file: .env
     depends_on:
-      postgres: { condition: service_healthy }
-      redis:    { condition: service_healthy }
+      postgres:      { condition: service_healthy }
+      redis:         { condition: service_healthy }
+      control-plane: { condition: service_healthy }

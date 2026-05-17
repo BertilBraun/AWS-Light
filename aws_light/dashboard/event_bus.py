@@ -37,7 +37,7 @@ class EventBus:
             if queue in self._subscribers:
                 self._subscribers.remove(queue)
 
-    def get_recent_events(self) -> list[WebSocketEvent]:
+    async def get_recent_events(self) -> list[WebSocketEvent]:
         return list(self._recent_events)
 
 

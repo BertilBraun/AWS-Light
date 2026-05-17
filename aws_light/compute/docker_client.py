@@ -27,6 +27,17 @@ class ContainerInfo:
     labels: dict[str, str]
 
 
+@dataclass
+class ComposeContainerInfo:
+    service: str
+    container_id: str
+    name: str
+    image: str
+    status: str
+    health: str
+    ports: list[str]
+
+
 class DockerClient:
     def __init__(self) -> None:
         self._client = docker.from_env()
@@ -127,6 +138,54 @@ class DockerClient:
         except docker.errors.NotFound:
             return False
 
+    def get_container_logs(self, container_id: str, tail: int = 200) -> str:
+        try:
+            container: Container = self._client.containers.get(container_id)
+            raw_logs = container.logs(stdout=True, stderr=True, tail=tail, timestamps=True)
+            return raw_logs.decode(errors="replace")
+        except docker.errors.NotFound:
+            return ""
+
+    def list_compose_containers(
+        self, project_name: str = "aws-light"
+    ) -> list[ComposeContainerInfo]:
+        containers = self._client.containers.list(
+            all=True,
+            filters={"label": f"com.docker.compose.project={project_name}"},
+        )
+        if not containers:
+            containers = [
+                container
+                for container in self._client.containers.list(all=True)
+                if container.name.startswith(f"{project_name}-")
+            ]
+        return [self._compose_container_info(container) for container in containers]
+
+    def _compose_container_info(self, container: Container) -> ComposeContainerInfo:
+        container.reload()
+        labels = container.labels or {}
+        service = labels.get(
+            "com.docker.compose.service",
+            _service_name_from_container(container.name),
+        )
+        image_tags = getattr(container.image, "tags", []) or []
+        state = container.attrs.get("State", {})
+        health = state.get("Health", {}).get("Status", "")
+        network_settings = container.attrs.get("NetworkSettings", {})
+        return ComposeContainerInfo(
+            service=service,
+            container_id=container.id,
+            name=container.name,
+            image=(
+                image_tags[0]
+                if image_tags
+                else container.attrs.get("Config", {}).get("Image", "")
+            ),
+            status=container.status,
+            health=health,
+            ports=_format_ports(network_settings.get("Ports", {}) or {}),
+        )
+
 
 def _calculate_cpu_percent(raw_stats: dict) -> float:  # type: ignore[type-arg]
     cpu_delta = (
@@ -140,3 +199,21 @@ def _calculate_cpu_percent(raw_stats: dict) -> float:  # type: ignore[type-arg]
     if system_delta <= 0 or cpu_delta < 0:
         return 0.0
     return (cpu_delta / system_delta) * num_cpus * 100.0
+
+
+def _service_name_from_container(container_name: str) -> str:
+    name = container_name.removeprefix("aws-light-")
+    return name.rsplit("-", 1)[0]
+
+
+def _format_ports(raw_ports: dict) -> list[str]:  # type: ignore[type-arg]
+    formatted = []
+    for container_port, host_bindings in raw_ports.items():
+        if not host_bindings:
+            formatted.append(str(container_port))
+            continue
+        for binding in host_bindings:
+            host_ip = binding.get("HostIp", "")
+            host_port = binding.get("HostPort", "")
+            formatted.append(f"{host_ip}:{host_port}->{container_port}")
+    return formatted

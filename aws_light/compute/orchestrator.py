@@ -41,6 +41,7 @@ class ComputeOrchestrator:
         routing_table: AnyRoutingTable,
         secrets_manager: SecretsManager,
         redis_client: object | None = None,
+        node_store: object | None = None,
     ) -> None:
         self._service_store = service_store
         self._deployment_store = deployment_store
@@ -51,6 +52,7 @@ class ComputeOrchestrator:
         self._routing_table = routing_table
         self._secrets_manager = secrets_manager
         self._redis = redis_client
+        self._node_store = node_store
         self._running = False
         self._executing_rollouts: set[str] = set()
 
@@ -80,7 +82,23 @@ class ComputeOrchestrator:
     async def _reconcile_all(self) -> None:
         all_services = await self._service_store.list()
         for service_state in all_services:
-            await self._reconcile_service(service_state)
+            if service_state.status == ResourceStatus.DELETING:
+                await self._teardown_service(service_state)
+            else:
+                await self._reconcile_service(service_state)
+        if self._node_store is not None:
+            await self._sync_nodes_to_store()
+
+    async def _sync_nodes_to_store(self) -> None:
+        for node_state in self._node_manager.get_all_nodes():
+            await self._node_store.put(node_state.spec.node_id, node_state)  # type: ignore[union-attr]
+
+    async def _teardown_service(self, service_state: ServiceState) -> None:
+        for replica in list(service_state.replicas):
+            await self._remove_replica(service_state, replica)
+        await self._service_store.delete(service_state.spec.name)
+        await self._routing_table.remove_service(service_state.spec.name)
+        logger.info("Tore down deleted service %s", service_state.spec.name)
 
     async def _reconcile_service(self, service_state: ServiceState) -> None:
         spec = service_state.spec

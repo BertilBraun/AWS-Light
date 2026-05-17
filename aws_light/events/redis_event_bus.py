@@ -40,7 +40,10 @@ class RedisEventBus:
                 await task
 
     async def get_recent_events(self) -> list[WebSocketEvent]:
-        entries = await self._redis.xrange(_STREAM_KEY, count=100)
+        try:
+            entries = await self._redis.xrange(_STREAM_KEY, count=100)
+        except Exception:
+            return []
         events = []
         for _entry_id, fields in entries:
             raw = fields.get(b"event") or fields.get("event")
@@ -49,7 +52,10 @@ class RedisEventBus:
         return events
 
     async def _current_stream_id(self) -> str:
-        info = await self._redis.xinfo_stream(_STREAM_KEY)
+        try:
+            info = await self._redis.xinfo_stream(_STREAM_KEY)
+        except Exception:
+            return "0-0"
         if isinstance(info, dict):
             last = info.get("last-generated-id") or info.get("last_generated_id") or "0-0"
         else:
