@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status
 
 from aws_light.compute.docker_client import DockerClient
+from aws_light.config import settings
 from aws_light.dependencies import get_event_bus
 
 router = APIRouter(prefix="/api/v1/platform", tags=["platform"])
@@ -41,6 +42,16 @@ async def list_platform_services() -> list[dict[str, object]]:
         }
         for name in ordered_names
     ]
+
+
+@router.get("/config")
+async def get_platform_config() -> dict[str, object]:
+    return {
+        "scheduler_policy": settings.scheduler_policy,
+        "node_count": settings.node_count,
+        "node_cpu_capacity": settings.node_cpu_capacity,
+        "node_memory_capacity_mb": settings.node_memory_capacity_mb,
+    }
 
 
 @router.get("/services/{service_name}/logs")

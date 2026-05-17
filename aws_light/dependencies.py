@@ -7,9 +7,8 @@ from aws_light.secrets.secrets_manager import SecretsManager
 from aws_light.storage.presigned import PresignedUrlService
 from aws_light.storage.storage_service import StorageService
 
-# All module-level state is registered here by whichever main module starts up
-# (monolith aws_light/main.py or microservice services/control-plane/main.py).
-# API route modules always import getters from here, never from a specific main.
+# All module-level state is registered here by the control-plane runtime entrypoint.
+# API route modules always import getters from here, never from a specific service main.
 
 _service_store: Any = None
 _deployment_store: Any = None

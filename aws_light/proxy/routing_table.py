@@ -22,7 +22,7 @@ class AnyRoutingTable(Protocol):
 
 
 class RoutingTable:
-    """In-memory routing table — used in tests and the monolith."""
+    """In-memory routing table used by tests."""
 
     def __init__(self) -> None:
         self._table: dict[str, list[ReplicaEndpoint]] = {}

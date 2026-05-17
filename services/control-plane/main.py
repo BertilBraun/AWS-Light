@@ -98,8 +98,9 @@ async def _seed_default_admin(user_store: PostgresStore[UserSpec]) -> None:
         await user_store.put(admin.username, admin)
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="AWS Light", version="0.1.0", lifespan=lifespan)
+def create_app(lifespan_override: object = None) -> FastAPI:
+    chosen_lifespan = lifespan_override if lifespan_override is not None else lifespan
+    app = FastAPI(title="AWS Light", version="0.1.0", lifespan=chosen_lifespan)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

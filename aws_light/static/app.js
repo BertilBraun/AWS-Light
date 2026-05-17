@@ -2,6 +2,7 @@
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const nodeGrid        = document.getElementById('node-grid');
+const platformConfig  = document.getElementById('platform-config');
 const platformBody    = document.getElementById('platform-body');
 const platformDetailPanel = document.getElementById('platform-detail-panel');
 const servicesBody    = document.getElementById('services-body');
@@ -75,6 +76,18 @@ async function loadPlatformServices() {
     platformBody.innerHTML = `
       <tr><td colspan="5" class="muted small">Could not load platform services: ${escapeHtml(error.message)}</td></tr>
     `;
+  }
+}
+
+async function loadPlatformConfig() {
+  if (!platformConfig) return;
+  try {
+    const response = await fetch('/api/v1/platform/config');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const config = await response.json();
+    platformConfig.textContent = `scheduler: ${config.scheduler_policy}, nodes: ${config.node_count} x ${config.node_cpu_capacity} CPU`;
+  } catch (error) {
+    platformConfig.textContent = 'scheduler: unknown';
   }
 }
 
@@ -501,5 +514,6 @@ function summarisePayload(kind, payload) {
 }
 
 connect();
+loadPlatformConfig();
 loadPlatformServices();
 setInterval(loadPlatformServices, 5000);
