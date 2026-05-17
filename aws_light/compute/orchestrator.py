@@ -16,7 +16,7 @@ from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.service import ReplicaState, ServiceState
 from aws_light.proxy.routing_table import AnyRoutingTable, ReplicaEndpoint
 from aws_light.secrets.secrets_manager import SecretsManager
-from aws_light.store.json_store import JsonStore
+from aws_light.store.base import AnyStore
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +32,8 @@ _ROLLOUT_HEALTH_WAIT_TIMEOUT = 60
 class ComputeOrchestrator:
     def __init__(
         self,
-        service_store: JsonStore[ServiceState],
-        deployment_store: JsonStore[RolloutState],
+        service_store: AnyStore[ServiceState],
+        deployment_store: AnyStore[RolloutState],
         docker_client: DockerClient,
         node_manager: NodeManager,
         scheduler: Scheduler,
@@ -102,6 +102,7 @@ class ComputeOrchestrator:
 
     async def _reconcile_service(self, service_state: ServiceState) -> None:
         spec = service_state.spec
+        service_state = await self._refresh_observed_replicas(service_state)
         running_replicas = [
             replica
             for replica in service_state.replicas
@@ -145,6 +146,60 @@ class ComputeOrchestrator:
                 await self._service_store.put(spec.name, updated_service)
             if status_changed or replicas_changed:
                 await self._emit_service_updated(updated_service)
+
+    async def _refresh_observed_replicas(self, service_state: ServiceState) -> ServiceState:
+        spec = service_state.spec
+        changed = False
+        observed_replicas: list[ReplicaState] = []
+
+        for replica in service_state.replicas:
+            if replica.status != ResourceStatus.RUNNING:
+                observed_replicas.append(replica)
+                continue
+
+            if not self._docker_client.container_is_running(replica.container_id):
+                logger.warning(
+                    "Replica %s for %s is missing or stopped; removing from observed state",
+                    replica.replica_id[:8],
+                    spec.name,
+                )
+                self._docker_client.remove_container(replica.container_id)
+                self._node_manager.deallocate(
+                    replica.node_id, replica.replica_id, spec.cpu_request, spec.memory_request_mb
+                )
+                await self._emit_node_updated(replica.node_id)
+                changed = True
+                await self._event_bus.publish(
+                    WebSocketEvent(
+                        kind=EventKind.REPLICA_FAILED,
+                        payload={
+                            "replica_id": replica.replica_id,
+                            "service_name": spec.name,
+                            "node_id": replica.node_id,
+                            "error": "container missing or stopped",
+                        },
+                    )
+                )
+                continue
+
+            if not replica.container_ip:
+                replica.container_ip = self._docker_client.get_container_ip(
+                    replica.container_id, settings.docker_network
+                )
+                changed = True
+
+            self._node_manager.allocate(
+                replica.node_id, replica.replica_id, spec.cpu_request, spec.memory_request_mb
+            )
+            observed_replicas.append(replica)
+
+        if changed:
+            service_state.replicas = observed_replicas
+            service_state.updated_at = datetime.utcnow()
+            await self._service_store.put(spec.name, service_state)
+
+        await self._sync_routing_table(service_state)
+        return service_state
 
     # ── Rollout loop ──────────────────────────────────────────────────────────
 

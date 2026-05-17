@@ -31,6 +31,8 @@ class NodeManager:
 
     def allocate(self, node_id: str, replica_id: str, cpu: float, memory_mb: float) -> None:
         node = self._nodes[node_id]
+        if replica_id in node.replica_ids:
+            return
         node.usage.cpu_used += cpu
         node.usage.memory_used_mb += memory_mb
         node.replica_ids.append(replica_id)

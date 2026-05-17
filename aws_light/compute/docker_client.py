@@ -138,6 +138,14 @@ class DockerClient:
         except docker.errors.NotFound:
             return False
 
+    def container_is_running(self, container_id: str) -> bool:
+        try:
+            container: Container = self._client.containers.get(container_id)
+            container.reload()
+            return container.status == "running"
+        except docker.errors.NotFound:
+            return False
+
     def get_container_logs(self, container_id: str, tail: int = 200) -> str:
         try:
             container: Container = self._client.containers.get(container_id)

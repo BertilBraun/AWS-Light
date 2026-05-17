@@ -48,7 +48,11 @@ async def get_service(name: str, _: UserSpec = Depends(get_current_user)) -> Ser
 
 
 @router.get("/{name}/logs")
-async def get_service_logs(name: str, tail: int = 200) -> dict[str, object]:
+async def get_service_logs(
+    name: str,
+    tail: int = 200,
+    _: UserSpec = require_role(Role.DEVELOPER),
+) -> dict[str, object]:
     service_state = await get_service_store().get(name)
     if service_state is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service not found")

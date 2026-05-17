@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from aws_light.compute.docker_client import DockerClient
 from aws_light.config import settings
 from aws_light.dependencies import get_event_bus
+from aws_light.iam.middleware import get_current_user, require_role
+from aws_light.models.iam import Role, UserSpec
 
 router = APIRouter(prefix="/api/v1/platform", tags=["platform"])
 
@@ -20,7 +22,9 @@ _PLATFORM_SERVICE_ORDER = [
 
 
 @router.get("/services")
-async def list_platform_services() -> list[dict[str, object]]:
+async def list_platform_services(
+    _: UserSpec = require_role(Role.ADMIN),
+) -> list[dict[str, object]]:
     docker_client = DockerClient()
     containers = docker_client.list_compose_containers()
     by_service = {container.service: container for container in containers}
@@ -45,7 +49,7 @@ async def list_platform_services() -> list[dict[str, object]]:
 
 
 @router.get("/config")
-async def get_platform_config() -> dict[str, object]:
+async def get_platform_config(_: UserSpec = Depends(get_current_user)) -> dict[str, object]:
     return {
         "scheduler_policy": settings.scheduler_policy,
         "node_count": settings.node_count,
@@ -55,7 +59,11 @@ async def get_platform_config() -> dict[str, object]:
 
 
 @router.get("/services/{service_name}/logs")
-async def get_platform_service_logs(service_name: str, tail: int = 200) -> dict[str, object]:
+async def get_platform_service_logs(
+    service_name: str,
+    tail: int = 200,
+    _: UserSpec = require_role(Role.ADMIN),
+) -> dict[str, object]:
     docker_client = DockerClient()
     containers = docker_client.list_compose_containers()
     container = next((item for item in containers if item.service == service_name), None)
@@ -75,7 +83,10 @@ async def get_platform_service_logs(service_name: str, tail: int = 200) -> dict[
 
 
 @router.get("/services/{service_name}/activity")
-async def get_platform_service_activity(service_name: str) -> dict[str, object]:
+async def get_platform_service_activity(
+    service_name: str,
+    _: UserSpec = require_role(Role.ADMIN),
+) -> dict[str, object]:
     if service_name not in _PLATFORM_SERVICE_ORDER:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

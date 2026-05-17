@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -70,7 +71,6 @@ def test_list_objects_with_prefix_filters(storage: StorageService) -> None:
 def test_presigned_url_validates_correctly() -> None:
     service = PresignedUrlService(secret_key="test-secret", base_url="http://localhost:8000")
     url = service.generate_presigned_get("my-bucket", "file.txt", ttl_seconds=3600)
-    from urllib.parse import parse_qs, urlparse
 
     parsed = urlparse(url)
     params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
@@ -82,10 +82,20 @@ def test_presigned_url_validates_correctly() -> None:
 def test_presigned_url_rejects_tampered_signature() -> None:
     service = PresignedUrlService(secret_key="test-secret", base_url="http://localhost:8000")
     url = service.generate_presigned_get("my-bucket", "file.txt", ttl_seconds=3600)
-    from urllib.parse import parse_qs, urlparse
 
     parsed = urlparse(url)
     params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
     assert not service.validate_presigned_url(
         params["bucket"], params["key"], params["expires"], "tampered-signature"
+    )
+
+
+def test_presigned_url_rejects_expired_url() -> None:
+    service = PresignedUrlService(secret_key="test-secret", base_url="http://localhost:8000")
+    url = service.generate_presigned_get("my-bucket", "file.txt", ttl_seconds=-1)
+
+    parsed = urlparse(url)
+    params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+    assert not service.validate_presigned_url(
+        params["bucket"], params["key"], params["expires"], params["signature"]
     )
