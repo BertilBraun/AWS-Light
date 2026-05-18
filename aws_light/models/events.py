@@ -9,14 +9,19 @@ from pydantic import BaseModel, Field
 
 
 class EventKind(str, Enum):
+    PLATFORM_STARTED = "platform.started"
     SERVICE_UPDATED = "service.updated"
     REPLICA_STARTED = "replica.started"
     REPLICA_STOPPED = "replica.stopped"
     REPLICA_FAILED = "replica.failed"
+    SCHEDULER_SELECTED = "scheduler.selected"
+    SCHEDULER_NO_CAPACITY = "scheduler.no_capacity"
     NODE_UPDATED = "node.updated"
     AUTOSCALE_EVALUATED = "autoscale.evaluated"
     AUTOSCALE_TRIGGERED = "autoscale.triggered"
     ROLLOUT_PROGRESS = "rollout.progress"
+    PROXY_REQUEST_FAILED = "proxy.request_failed"
+    HEALTH_CHECK_PASSED = "health_check.passed"
     HEALTH_CHECK_RECOVERED = "health_check.recovered"
     HEALTH_CHECK_FAILED = "health_check.failed"
     SECRET_CREATED = "secret.created"

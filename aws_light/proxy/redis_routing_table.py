@@ -10,12 +10,15 @@ _SET_HEALTHY_LUA = """
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
 local endpoints = cjson.decode(raw)
+local found = 0
 for i, ep in ipairs(endpoints) do
     if ep['replica_id'] == ARGV[1] then
         ep['healthy'] = ARGV[2] == 'true'
         endpoints[i] = ep
+        found = 1
     end
 end
+if found == 0 then return 0 end
 redis.call('SET', KEYS[1], cjson.encode(endpoints))
 return 1
 """
@@ -30,13 +33,17 @@ class RedisRoutingTable:
         self._redis = redis_client
 
     async def update_service(self, service_name: str, endpoints: list[ReplicaEndpoint]) -> None:
+        existing_health = {
+            endpoint.replica_id: endpoint.healthy
+            for endpoint in await self.get_endpoints(service_name)
+        }
         data = json.dumps(
             [
                 {
                     "replica_id": ep.replica_id,
                     "host": ep.host,
                     "port": ep.port,
-                    "healthy": ep.healthy,
+                    "healthy": existing_health.get(ep.replica_id, ep.healthy),
                 }
                 for ep in endpoints
             ]

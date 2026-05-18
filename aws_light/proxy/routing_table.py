@@ -10,7 +10,7 @@ class ReplicaEndpoint:
     replica_id: str
     host: str
     port: int
-    healthy: bool = True
+    healthy: bool = False
 
 
 class AnyRoutingTable(Protocol):
@@ -30,7 +30,19 @@ class RoutingTable:
 
     async def update_service(self, service_name: str, endpoints: list[ReplicaEndpoint]) -> None:
         async with self._lock:
-            self._table[service_name] = endpoints
+            existing_health = {
+                endpoint.replica_id: endpoint.healthy
+                for endpoint in self._table.get(service_name, [])
+            }
+            self._table[service_name] = [
+                ReplicaEndpoint(
+                    replica_id=endpoint.replica_id,
+                    host=endpoint.host,
+                    port=endpoint.port,
+                    healthy=existing_health.get(endpoint.replica_id, endpoint.healthy),
+                )
+                for endpoint in endpoints
+            ]
 
     async def get_endpoints(self, service_name: str) -> list[ReplicaEndpoint]:
         async with self._lock:

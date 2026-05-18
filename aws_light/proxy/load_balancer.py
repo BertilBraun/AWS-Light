@@ -16,6 +16,9 @@ class RoundRobinBalancer:
         self._lock = asyncio.Lock()
 
     async def next_healthy_replica(self, service_name: str) -> ReplicaEndpoint:
+        return (await self.healthy_replicas_for_request(service_name))[0]
+
+    async def healthy_replicas_for_request(self, service_name: str) -> list[ReplicaEndpoint]:
         endpoints = await self._routing_table.get_endpoints(service_name)
         healthy_endpoints = [endpoint for endpoint in endpoints if endpoint.healthy]
         if not healthy_endpoints:
@@ -23,7 +26,7 @@ class RoundRobinBalancer:
 
         async with self._lock:
             current_index = self._counters.get(service_name, 0)
-            selected = healthy_endpoints[current_index % len(healthy_endpoints)]
             self._counters[service_name] = current_index + 1
 
-        return selected
+        offset = current_index % len(healthy_endpoints)
+        return healthy_endpoints[offset:] + healthy_endpoints[:offset]

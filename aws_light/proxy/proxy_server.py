@@ -10,6 +10,10 @@ from aws_light.proxy.load_balancer import NoHealthyReplicaError, RoundRobinBalan
 if TYPE_CHECKING:
     from redis.asyncio import Redis
 
+    from aws_light.dashboard.event_bus import EventBus
+
+from aws_light.models.events import EventKind, WebSocketEvent
+
 logger = logging.getLogger(__name__)
 
 _HEADER_DELIMITER = b"\r\n\r\n"
@@ -26,46 +30,43 @@ _HOP_BY_HOP_HEADERS = {
 }
 _RESPONSE_HOP_BY_HOP_HEADERS = _HOP_BY_HOP_HEADERS - {b"transfer-encoding"}
 
-_503_RESPONSE = (
-    b"HTTP/1.1 503 Service Unavailable\r\n"
-    b"Content-Type: application/json\r\n"
-    b"Content-Length: 36\r\n"
-    b"Connection: close\r\n"
-    b"\r\n"
-    b'{"error": "no healthy replica found"}'
-)
+def _error_response(status_line: bytes, body: bytes) -> bytes:
+    return (
+        status_line
+        + b"\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"Connection: close\r\n"
+        + b"\r\n"
+        + body
+    )
 
-_502_RESPONSE = (
-    b"HTTP/1.1 502 Bad Gateway\r\n"
-    b"Content-Type: application/json\r\n"
-    b"Content-Length: 29\r\n"
-    b"Connection: close\r\n"
-    b"\r\n"
-    b'{"error": "upstream unreachable"}'
-)
 
-_400_RESPONSE = (
-    b"HTTP/1.1 400 Bad Request\r\n"
-    b"Content-Type: application/json\r\n"
-    b"Content-Length: 24\r\n"
-    b"Connection: close\r\n"
-    b"\r\n"
-    b'{"error": "bad request"}'
+_503_RESPONSE = _error_response(
+    b"HTTP/1.1 503 Service Unavailable",
+    b'{"error": "no healthy replica found"}',
 )
-
-_501_RESPONSE = (
-    b"HTTP/1.1 501 Not Implemented\r\n"
-    b"Content-Type: application/json\r\n"
-    b"Content-Length: 42\r\n"
-    b"Connection: close\r\n"
-    b"\r\n"
-    b'{"error": "transfer encoding unsupported"}'
+_502_RESPONSE = _error_response(
+    b"HTTP/1.1 502 Bad Gateway",
+    b'{"error": "upstream unreachable"}',
+)
+_504_RESPONSE = _error_response(
+    b"HTTP/1.1 504 Gateway Timeout",
+    b'{"error": "upstream timeout"}',
+)
+_400_RESPONSE = _error_response(
+    b"HTTP/1.1 400 Bad Request",
+    b'{"error": "bad request"}',
+)
+_501_RESPONSE = _error_response(
+    b"HTTP/1.1 501 Not Implemented",
+    b'{"error": "transfer encoding unsupported"}',
 )
 
 _PROXY_METRIC_TOTAL = "proxy:requests:total"
 _PROXY_METRIC_BY_SERVICE = "proxy:requests:service"
 _PROXY_METRIC_BY_STATUS = "proxy:responses:status"
 _PROXY_METRIC_FAILURES = "proxy:failures"
+_PROXY_TIMESERIES_BUCKET_SECONDS = 10
 
 
 class ProxyServer:
@@ -74,10 +75,12 @@ class ProxyServer:
         balancer: RoundRobinBalancer,
         port: int,
         redis_client: Redis | None = None,  # type: ignore[type-arg]
+        event_bus: EventBus | None = None,
     ) -> None:
         self._balancer = balancer
         self._port = port
         self._redis = redis_client
+        self._event_bus = event_bus
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
@@ -141,7 +144,7 @@ class ProxyServer:
             return
 
         try:
-            endpoint = await self._balancer.next_healthy_replica(service_name)
+            endpoints = await self._balancer.healthy_replicas_for_request(service_name)
         except NoHealthyReplicaError:
             writer.write(_503_RESPONSE)
             await writer.drain()
@@ -152,14 +155,38 @@ class ProxyServer:
             await self._redis.incr(f"rps:{service_name}")
 
         started = time.perf_counter()
-        try:
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(endpoint.host, endpoint.port), timeout=5.0
-            )
-        except (OSError, asyncio.TimeoutError):
+        upstream_reader: asyncio.StreamReader | None = None
+        upstream_writer: asyncio.StreamWriter | None = None
+        endpoint = None
+        failures: list[str] = []
+        for candidate in endpoints:
+            try:
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(candidate.host, candidate.port), timeout=5.0
+                )
+                endpoint = candidate
+                break
+            except (OSError, asyncio.TimeoutError) as error:
+                failures.append(f"{candidate.replica_id[:8]} {candidate.host}:{candidate.port}")
+                logger.warning(
+                    "Proxy could not connect to %s replica %s at %s:%d: %s",
+                    service_name,
+                    candidate.replica_id[:8],
+                    candidate.host,
+                    candidate.port,
+                    error,
+                )
+
+        if upstream_reader is None or upstream_writer is None or endpoint is None:
             writer.write(_502_RESPONSE)
             await writer.drain()
             duration_ms = (time.perf_counter() - started) * 1000
+            logger.warning(
+                "Proxy returning 502 for %s after %d failed upstream connection attempts: %s",
+                service_name,
+                len(failures),
+                ", ".join(failures) or "none",
+            )
             await self._record_proxy_result(service_name, 502, "upstream_unreachable", duration_ms)
             return
 
@@ -177,7 +204,34 @@ class ProxyServer:
                 return_exceptions=True,
             )
         else:
-            upstream_response = await _read_full_response(upstream_reader)
+            try:
+                upstream_response = await _read_full_response(upstream_reader)
+            except UpstreamResponseTimeout:
+                writer.write(_504_RESPONSE)
+                await writer.drain()
+                upstream_writer.close()
+                await upstream_writer.wait_closed()
+                duration_ms = (time.perf_counter() - started) * 1000
+                logger.warning(
+                    "Proxy timed out waiting for %s replica %s response after %.2fms",
+                    service_name,
+                    endpoint.replica_id[:8],
+                    duration_ms,
+                )
+                await self._record_proxy_result(
+                    service_name, 504, "upstream_response_timeout", duration_ms
+                )
+                return
+            except UpstreamResponseError:
+                writer.write(_502_RESPONSE)
+                await writer.drain()
+                upstream_writer.close()
+                await upstream_writer.wait_closed()
+                duration_ms = (time.perf_counter() - started) * 1000
+                await self._record_proxy_result(
+                    service_name, 502, "upstream_invalid_response", duration_ms
+                )
+                return
             status_code = _extract_response_status(upstream_response) or 502
             writer.write(upstream_response)
             await writer.drain()
@@ -202,9 +256,31 @@ class ProxyServer:
         if service_name:
             pipe.hincrby(_PROXY_METRIC_BY_SERVICE, service_name, 1)
             pipe.set(f"proxy:last_duration_ms:{service_name}", f"{duration_ms:.2f}")
+        bucket = (
+            int(time.time() // _PROXY_TIMESERIES_BUCKET_SECONDS) * _PROXY_TIMESERIES_BUCKET_SECONDS
+        )
+        timeseries_service = service_name or "__unknown__"
+        pipe.hincrby(f"proxy:ts:requests:{bucket}", timeseries_service, 1)
+        pipe.hincrby(f"proxy:ts:status:{bucket}", str(status_code), 1)
+        pipe.hincrby(f"proxy:ts:latency_sum:{bucket}", timeseries_service, int(duration_ms * 100))
+        pipe.hincrby(f"proxy:ts:latency_count:{bucket}", timeseries_service, 1)
+        if status_code >= 500:
+            pipe.hincrby(f"proxy:ts:errors:{bucket}", timeseries_service, 1)
         if failure_reason:
             pipe.hincrby(_PROXY_METRIC_FAILURES, failure_reason, 1)
         await pipe.execute()
+        if failure_reason and self._event_bus is not None:
+            await self._event_bus.publish(
+                WebSocketEvent(
+                    kind=EventKind.PROXY_REQUEST_FAILED,
+                    payload={
+                        "service_name": service_name,
+                        "status_code": status_code,
+                        "failure_reason": failure_reason,
+                        "duration_ms": round(duration_ms, 2),
+                    },
+                )
+            )
 
 
 async def _read_http_head(reader: asyncio.StreamReader) -> tuple[bytes, bytes]:
@@ -295,10 +371,21 @@ async def _pipe_stream(source: asyncio.StreamReader, destination: asyncio.Stream
         destination.close()
 
 
+class UpstreamResponseError(Exception):
+    pass
+
+
+class UpstreamResponseTimeout(UpstreamResponseError):
+    pass
+
+
 async def _read_full_response(reader: asyncio.StreamReader) -> bytes:
-    header_bytes, body_prefix = await _read_http_head(reader)
+    try:
+        header_bytes, body_prefix = await _read_http_head(reader)
+    except asyncio.TimeoutError as exc:
+        raise UpstreamResponseTimeout from exc
     if not header_bytes:
-        return b""
+        raise UpstreamResponseError
 
     rewritten_headers = _rewrite_response_headers(header_bytes)
     content_length = _extract_content_length(header_bytes)
@@ -311,7 +398,7 @@ async def _read_full_response(reader: asyncio.StreamReader) -> bytes:
                     break
                 chunks.append(chunk)
         except asyncio.TimeoutError:
-            pass
+            raise UpstreamResponseTimeout from None
         return b"".join(chunks)
 
     body = body_prefix[:content_length]
@@ -321,11 +408,13 @@ async def _read_full_response(reader: asyncio.StreamReader) -> bytes:
         while remaining > 0:
             chunk = await asyncio.wait_for(reader.read(min(4096, remaining)), timeout=30.0)
             if not chunk:
-                break
+                raise UpstreamResponseError
             chunks.append(chunk)
             remaining -= len(chunk)
-    except (asyncio.TimeoutError, asyncio.IncompleteReadError):
-        pass
+    except asyncio.TimeoutError:
+        raise UpstreamResponseTimeout from None
+    except asyncio.IncompleteReadError as exc:
+        raise UpstreamResponseError from exc
     return b"".join(chunks)
 
 
