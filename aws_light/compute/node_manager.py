@@ -45,3 +45,10 @@ class NodeManager:
         node.usage.memory_used_mb = max(0.0, node.usage.memory_used_mb - memory_mb)
         if replica_id in node.replica_ids:
             node.replica_ids.remove(replica_id)
+
+    def set_actual_usage(self, node_id: str, cpu_used: float, memory_used_mb: float) -> None:
+        node = self._nodes.get(node_id)
+        if node is None:
+            return
+        node.actual_usage.cpu_used = max(0.0, cpu_used)
+        node.actual_usage.memory_used_mb = max(0.0, memory_used_mb)

@@ -19,6 +19,7 @@ class NodeSpec(BaseModel):
 class NodeState(BaseModel):
     spec: NodeSpec
     usage: ResourceUsage = Field(default_factory=ResourceUsage)
+    actual_usage: ResourceUsage = Field(default_factory=ResourceUsage)
     status: ResourceStatus = ResourceStatus.RUNNING
     replica_ids: list[str] = Field(default_factory=list)
 

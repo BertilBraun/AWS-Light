@@ -13,6 +13,7 @@ from aws_light.dashboard.event_bus import EventBus
 from aws_light.models.common import ResourceStatus
 from aws_light.models.deployment import RolloutState
 from aws_light.models.events import EventKind, WebSocketEvent
+from aws_light.models.node import NodeState, ResourceUsage
 from aws_light.models.service import ReplicaState, ServiceState
 from aws_light.proxy.routing_table import AnyRoutingTable, ReplicaEndpoint
 from aws_light.secrets.secrets_manager import SecretsManager
@@ -27,6 +28,21 @@ _DOCKER_LABEL_NODE = "aws-light.node"
 
 _ROLLOUT_HEALTH_WAIT_INTERVAL = 2
 _ROLLOUT_HEALTH_WAIT_TIMEOUT = 60
+
+
+def _node_capacity_payload(node: NodeState) -> dict[str, object]:
+    return {
+        "node_id": node.spec.node_id,
+        "cpu_used": node.usage.cpu_used,
+        "cpu_capacity": node.spec.cpu_capacity,
+        "cpu_available": node.available_cpu,
+        "actual_cpu_used": node.actual_usage.cpu_used,
+        "memory_used_mb": node.usage.memory_used_mb,
+        "memory_capacity_mb": node.spec.memory_capacity_mb,
+        "memory_available_mb": node.available_memory_mb,
+        "actual_memory_used_mb": node.actual_usage.memory_used_mb,
+        "replica_count": len(node.replica_ids),
+    }
 
 
 class ComputeOrchestrator:
@@ -319,7 +335,38 @@ class ComputeOrchestrator:
             )
         except SchedulingError:
             logger.warning("Cannot schedule replica for %s: no capacity", spec.name)
+            await self._event_bus.publish(
+                WebSocketEvent(
+                    kind=EventKind.SCHEDULER_NO_CAPACITY,
+                    payload={
+                        "service_name": spec.name,
+                        "cpu_request": spec.cpu_request,
+                        "memory_request_mb": spec.memory_request_mb,
+                        "scheduler_policy": settings.scheduler_policy,
+                        "candidate_nodes": [
+                            _node_capacity_payload(node)
+                            for node in sorted(nodes, key=lambda item: item.spec.node_id)
+                        ],
+                    },
+                )
+            )
             return
+        await self._event_bus.publish(
+            WebSocketEvent(
+                kind=EventKind.SCHEDULER_SELECTED,
+                payload={
+                    "service_name": spec.name,
+                    "node_id": target_node.spec.node_id,
+                    "cpu_request": spec.cpu_request,
+                    "memory_request_mb": spec.memory_request_mb,
+                    "scheduler_policy": settings.scheduler_policy,
+                    "candidate_nodes": [
+                        _node_capacity_payload(node)
+                        for node in sorted(nodes, key=lambda item: item.spec.node_id)
+                    ],
+                },
+            )
+        )
 
         replica_id = str(uuid.uuid4())
         container_name = f"aws-light-{spec.name}-{replica_id[:8]}"
@@ -466,7 +513,9 @@ class ComputeOrchestrator:
                 payload={
                     "node_id": node_id,
                     "cpu_used": node.usage.cpu_used,
+                    "actual_cpu_used": node.actual_usage.cpu_used,
                     "memory_used_mb": node.usage.memory_used_mb,
+                    "actual_memory_used_mb": node.actual_usage.memory_used_mb,
                     "replica_count": len(node.replica_ids),
                 },
             )
@@ -500,17 +549,39 @@ class ComputeOrchestrator:
 
     async def _collect_and_publish_cpu_stats(self) -> None:
         loop = asyncio.get_running_loop()
+        actual_usage_by_node: dict[str, ResourceUsage] = {
+            node.spec.node_id: ResourceUsage() for node in self._node_manager.get_all_nodes()
+        }
         for service_state in await self._service_store.list():
-            samples = []
-            for replica in service_state.replicas:
-                container_id = replica.container_id
-                stats = await loop.run_in_executor(
-                    None, self._docker_client.get_container_stats, container_id
-                )
+            cpu_utilization_samples = []
+            requested_cpu = max(service_state.spec.cpu_request, 0.001)
+            stats_results = await asyncio.gather(
+                *[
+                    loop.run_in_executor(
+                        None, self._docker_client.get_container_stats, replica.container_id
+                    )
+                    for replica in service_state.replicas
+                ]
+            )
+            for replica, stats in zip(service_state.replicas, stats_results, strict=True):
                 if stats is not None:
-                    samples.append(stats.cpu_percent)
-            average_cpu = sum(samples) / len(samples) if samples else 0.0
+                    actual_cpu_cores = stats.cpu_percent / 100
+                    cpu_utilization_samples.append((actual_cpu_cores / requested_cpu) * 100)
+                    node_usage = actual_usage_by_node.setdefault(replica.node_id, ResourceUsage())
+                    node_usage.cpu_used += actual_cpu_cores
+                    node_usage.memory_used_mb += stats.memory_mb
+            average_cpu = (
+                sum(cpu_utilization_samples) / len(cpu_utilization_samples)
+                if cpu_utilization_samples
+                else 0.0
+            )
             await self._redis.set(f"cpu:{service_state.spec.name}", average_cpu)  # type: ignore[union-attr]
+
+        for node_id, usage in actual_usage_by_node.items():
+            self._node_manager.set_actual_usage(node_id, usage.cpu_used, usage.memory_used_mb)
+            await self._emit_node_updated(node_id)
+        if self._node_store is not None:
+            await self._sync_nodes_to_store()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
