@@ -239,7 +239,7 @@ def _event_to_activity(event: object) -> dict[str, object] | None:
 def _platform_service_for_event(kind: str) -> str | None:
     if kind == "platform.started":
         return None
-    if kind == "proxy.request_failed":
+    if kind in {"proxy.request_failed", "proxy.traffic_observed"}:
         return "proxy"
     if kind in {
         "replica.started",
@@ -300,6 +300,11 @@ def _summarize_activity(kind: str, payload: dict[str, object]) -> str:
         return (
             f"Returned {payload.get('status_code')} for {payload.get('service_name') or 'unknown'} "
             f"({payload.get('failure_reason')})"
+        )
+    if kind == "proxy.traffic_observed":
+        return (
+            f"Handled {payload.get('requests_total')} requests in "
+            f"{payload.get('window_seconds')}s with {payload.get('errors_total')} errors"
         )
     if kind == "autoscale.triggered":
         return (

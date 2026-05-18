@@ -20,6 +20,7 @@ class EventKind(str, Enum):
     AUTOSCALE_EVALUATED = "autoscale.evaluated"
     AUTOSCALE_TRIGGERED = "autoscale.triggered"
     ROLLOUT_PROGRESS = "rollout.progress"
+    PROXY_TRAFFIC_OBSERVED = "proxy.traffic_observed"
     PROXY_REQUEST_FAILED = "proxy.request_failed"
     HEALTH_CHECK_PASSED = "health_check.passed"
     HEALTH_CHECK_RECOVERED = "health_check.recovered"

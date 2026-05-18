@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
+from collections import Counter
 from typing import TYPE_CHECKING
 
 from aws_light.proxy.load_balancer import NoHealthyReplicaError, RoundRobinBalancer
@@ -67,6 +69,7 @@ _PROXY_METRIC_BY_SERVICE = "proxy:requests:service"
 _PROXY_METRIC_BY_STATUS = "proxy:responses:status"
 _PROXY_METRIC_FAILURES = "proxy:failures"
 _PROXY_TIMESERIES_BUCKET_SECONDS = 10
+_PROXY_ACTIVITY_INTERVAL_SECONDS = 10.0
 
 
 class ProxyServer:
@@ -82,12 +85,24 @@ class ProxyServer:
         self._redis = redis_client
         self._event_bus = event_bus
         self._server: asyncio.AbstractServer | None = None
+        self._activity_task: asyncio.Task[None] | None = None
+        self._traffic_lock = asyncio.Lock()
+        self._traffic_total = 0
+        self._traffic_by_service: Counter[str] = Counter()
+        self._traffic_by_status: Counter[int] = Counter()
+        self._traffic_failures: Counter[str] = Counter()
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_connection, "0.0.0.0", self._port)
+        if self._event_bus is not None:
+            self._activity_task = asyncio.create_task(self._traffic_activity_loop())
         logger.info("Proxy server listening on port %d", self._port)
 
     async def stop(self) -> None:
+        if self._activity_task is not None:
+            self._activity_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._activity_task
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -269,6 +284,7 @@ class ProxyServer:
         if failure_reason:
             pipe.hincrby(_PROXY_METRIC_FAILURES, failure_reason, 1)
         await pipe.execute()
+        await self._record_traffic_activity(service_name, status_code, failure_reason)
         if failure_reason and self._event_bus is not None:
             await self._event_bus.publish(
                 WebSocketEvent(
@@ -281,6 +297,62 @@ class ProxyServer:
                     },
                 )
             )
+
+    async def _record_traffic_activity(
+        self,
+        service_name: str | None,
+        status_code: int,
+        failure_reason: str | None,
+    ) -> None:
+        async with self._traffic_lock:
+            self._traffic_total += 1
+            self._traffic_by_service[service_name or "__unknown__"] += 1
+            self._traffic_by_status[status_code] += 1
+            if failure_reason:
+                self._traffic_failures[failure_reason] += 1
+
+    async def _traffic_activity_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_PROXY_ACTIVITY_INTERVAL_SECONDS)
+            await self._publish_traffic_activity()
+
+    async def _publish_traffic_activity(self) -> None:
+        if self._event_bus is None:
+            return
+        async with self._traffic_lock:
+            total = self._traffic_total
+            by_service = dict(self._traffic_by_service)
+            by_status = {str(status): count for status, count in self._traffic_by_status.items()}
+            failures = dict(self._traffic_failures)
+            self._traffic_total = 0
+            self._traffic_by_service.clear()
+            self._traffic_by_status.clear()
+            self._traffic_failures.clear()
+        if total == 0:
+            return
+        error_count = sum(
+            count for status, count in by_status.items() if int(status) >= 500
+        )
+        logger.info(
+            "Proxy handled %d requests in %.0fs (%d errors)",
+            total,
+            _PROXY_ACTIVITY_INTERVAL_SECONDS,
+            error_count,
+        )
+        await self._event_bus.publish(
+            WebSocketEvent(
+                kind=EventKind.PROXY_TRAFFIC_OBSERVED,
+                payload={
+                    "component": "proxy",
+                    "window_seconds": int(_PROXY_ACTIVITY_INTERVAL_SECONDS),
+                    "requests_total": total,
+                    "errors_total": error_count,
+                    "requests_by_service": by_service,
+                    "responses_by_status": by_status,
+                    "failures": failures,
+                },
+            )
+        )
 
 
 async def _read_http_head(reader: asyncio.StreamReader) -> tuple[bytes, bytes]:

@@ -194,3 +194,25 @@ async def test_record_proxy_result_publishes_failure_activity() -> None:
         "failure_reason": "upstream_unreachable",
         "duration_ms": 4.0,
     }
+
+
+async def test_proxy_publishes_aggregated_traffic_activity() -> None:
+    redis = FakeRedis()
+    event_bus = EventBus()
+    proxy = ProxyServer(
+        balancer=None,  # type: ignore[arg-type]
+        port=8080,
+        redis_client=redis,  # type: ignore[arg-type]
+        event_bus=event_bus,
+    )
+
+    await proxy._record_proxy_result("secret-service", 200, None, 12.3)
+    await proxy._record_proxy_result("secret-service", 502, "upstream_unreachable", 4.0)
+    await proxy._publish_traffic_activity()
+
+    events = await event_bus.get_recent_events()
+    assert events[-1].kind.value == "proxy.traffic_observed"
+    assert events[-1].payload["requests_total"] == 2
+    assert events[-1].payload["errors_total"] == 1
+    assert events[-1].payload["requests_by_service"] == {"secret-service": 2}
+    assert events[-1].payload["responses_by_status"] == {"200": 1, "502": 1}

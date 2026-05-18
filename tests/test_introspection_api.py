@@ -188,6 +188,20 @@ async def _seed_platform_metrics_and_events() -> None:
     )
     await deps.get_event_bus().publish(
         WebSocketEvent(
+            kind=EventKind.PROXY_TRAFFIC_OBSERVED,
+            payload={
+                "component": "proxy",
+                "window_seconds": 10,
+                "requests_total": 3,
+                "errors_total": 1,
+                "requests_by_service": {"secret-service": 3},
+                "responses_by_status": {"200": 2, "502": 1},
+                "failures": {"upstream_unreachable": 1},
+            },
+        )
+    )
+    await deps.get_event_bus().publish(
+        WebSocketEvent(
             kind=EventKind.HEALTH_CHECK_FAILED,
             payload={
                 "service_name": "other-service",
@@ -289,6 +303,7 @@ def test_platform_events_can_filter_component_startup(client: TestClient) -> Non
 
     assert response.status_code == 200
     assert [event["kind"] for event in response.json()["events"]] == [
+        "proxy.traffic_observed",
         "proxy.request_failed",
         "platform.started",
     ]
