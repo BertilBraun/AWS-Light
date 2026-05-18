@@ -319,9 +319,12 @@ aws-light/
 │   └── main.py                   ← unchanged
 │
 ├── examples/
-│   └── hello-service/
-│       ├── Dockerfile            ← unchanged
-│       └── main.py               ← unchanged
+│   ├── secret-service/
+│   ├── echo-service/
+│   ├── slow-service/
+│   ├── flaky-service/
+│   ├── cpu-service/
+│   └── storage-service/
 │
 └── tests/
     ├── conftest.py               ← MODIFIED: use JsonStore + in-memory stubs (no Postgres
@@ -659,7 +662,7 @@ Work in this order. Each phase leaves the system in a testable state.
 
 **Test:** `docker compose up` with just `redis` + the monolith (temporarily wire
 `RedisRoutingTable` into the existing `main.py`). Verify that `apply` creates a
-container, the routing table in Redis is populated, and `curl hello-service.localhost:8080`
+container, the routing table in Redis is populated, and `curl secret-service.localhost:8080`
 works.
 
 ### Phase 3 — Move RollingController into orchestrator
@@ -702,10 +705,10 @@ docker compose up --build
 
 # In another terminal:
 aws-light login --user admin --password admin
-aws-light apply examples/hello-service.yaml
+aws-light apply examples/secret-service.yaml
 
 # Wait ~5 s for reconcile tick
-curl http://hello-service.localhost:8080/
+curl http://secret-service.localhost:8080/
 # {"my_secret": "hello-from-secret", "another_secret": "second-secret-value"}
 
 # Kill Redis; wait 10 s; restart Redis

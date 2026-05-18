@@ -1,0 +1,15 @@
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: cpu-service
+spec:
+  image: aws-light/cpu-service:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 6
+  cpuRequest: 0.2
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  env: {}
+  secretRefs: []

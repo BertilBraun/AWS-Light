@@ -1,0 +1,17 @@
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: flaky-service
+spec:
+  image: aws-light/flaky-service:latest
+  replicas: 2
+  minReplicas: 1
+  maxReplicas: 4
+  cpuRequest: 0.1
+  memoryRequestMb: 96
+  port: 8000
+  healthCheckPath: /health
+  env:
+    REQUEST_FAILURE_RATE: "0.25"
+    HEALTH_FAILURE_RATE: "0.10"
+  secretRefs: []

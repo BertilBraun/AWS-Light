@@ -1,0 +1,113 @@
+apiVersion: aws-light/v1
+kind: Secrets
+secrets:
+  my-secret: hello-from-secret
+  another-secret: second-secret-value
+---
+apiVersion: aws-light/v1
+kind: Bucket
+metadata:
+  name: demo-objects
+spec:
+  versioning: false
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: secret-service
+spec:
+  image: aws-light/secret-service:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 4
+  cpuRequest: 0.2
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  env: {}
+  secretRefs:
+    - my-secret
+    - another-secret
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: echo-service
+spec:
+  image: aws-light/echo-service:latest
+  replicas: 2
+  minReplicas: 1
+  maxReplicas: 4
+  cpuRequest: 0.1
+  memoryRequestMb: 96
+  port: 8000
+  healthCheckPath: /health
+  env: {}
+  secretRefs: []
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: slow-service
+spec:
+  image: aws-light/slow-service:latest
+  replicas: 2
+  minReplicas: 1
+  maxReplicas: 5
+  cpuRequest: 0.2
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  env: {}
+  secretRefs: []
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: flaky-service
+spec:
+  image: aws-light/flaky-service:latest
+  replicas: 2
+  minReplicas: 1
+  maxReplicas: 4
+  cpuRequest: 0.1
+  memoryRequestMb: 96
+  port: 8000
+  healthCheckPath: /health
+  env:
+    REQUEST_FAILURE_RATE: "0.25"
+    HEALTH_FAILURE_RATE: "0.10"
+  secretRefs: []
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: cpu-service
+spec:
+  image: aws-light/cpu-service:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 6
+  cpuRequest: 0.2
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  env: {}
+  secretRefs: []
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: storage-service
+spec:
+  image: aws-light/storage-service:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 3
+  cpuRequest: 0.1
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  env:
+    STORE_ROOT: /tmp/aws-light-storage-demo
+  secretRefs: []

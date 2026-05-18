@@ -61,9 +61,9 @@ On an 8-core machine, AWS Light can simulate ~10 worker nodes, each limited to 0
 ## Example Workflow
 
 ```bash
-aws-light apply sentiment-api.yaml
+aws-light apply examples/demo-stack.yaml
 k6 run load.js
-aws-light status sentiment-api
+aws-light status secret-service
 ```
 
 This deploys a service, generates load using [k6](https://k6.io/), and displays scaling activity in real time.

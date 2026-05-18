@@ -58,7 +58,7 @@ def _parse_args() -> LoadTestConfig:
     parser.add_argument("--url", default="http://localhost:8080/", help="Proxy URL to call.")
     parser.add_argument(
         "--host",
-        default="hello-service.localhost",
+        default="secret-service.localhost",
         help="Host header used by the proxy to select the service.",
     )
     parser.add_argument(

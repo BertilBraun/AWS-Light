@@ -1,0 +1,15 @@
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: slow-service
+spec:
+  image: aws-light/slow-service:latest
+  replicas: 2
+  minReplicas: 1
+  maxReplicas: 5
+  cpuRequest: 0.2
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  env: {}
+  secretRefs: []

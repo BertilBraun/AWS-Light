@@ -1,0 +1,23 @@
+apiVersion: aws-light/v1
+kind: Bucket
+metadata:
+  name: demo-objects
+spec:
+  versioning: false
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: storage-service
+spec:
+  image: aws-light/storage-service:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 3
+  cpuRequest: 0.1
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  env:
+    STORE_ROOT: /tmp/aws-light-storage-demo
+  secretRefs: []

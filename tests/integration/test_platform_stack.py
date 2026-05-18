@@ -55,7 +55,7 @@ def test_core_flow_proxy_health_and_reconcile(
     api_client: httpx.Client,
     admin_headers: dict[str, str],
 ) -> None:
-    manifest = (ROOT / "examples" / "hello-service.yaml").read_text()
+    manifest = (ROOT / "examples" / "secret-service.yaml").read_text()
     apply_response = api_client.post(
         "/api/v1/manifests/apply",
         json={"yaml_text": manifest},
@@ -63,8 +63,8 @@ def test_core_flow_proxy_health_and_reconcile(
     )
     apply_response.raise_for_status()
 
-    service = _wait_for_service(api_client, admin_headers, "hello-service", replicas=2)
-    _wait_for_proxy("hello-service.localhost")
+    service = _wait_for_service(api_client, admin_headers, "secret-service", replicas=1)
+    _wait_for_proxy("secret-service.localhost")
 
     first_replica = service["replicas"][0]
     subprocess.run(
@@ -81,13 +81,13 @@ def test_core_flow_proxy_health_and_reconcile(
     recovered = _wait_for_service(
         api_client,
         admin_headers,
-        "hello-service",
-        replicas=2,
+        "secret-service",
+        replicas=1,
         absent_container_id=first_replica["container_id"],
     )
     recovered_ids = {replica["container_id"] for replica in recovered["replicas"]}
     assert first_replica["container_id"] not in recovered_ids
-    _wait_for_proxy("hello-service.localhost")
+    _wait_for_proxy("secret-service.localhost")
 
 
 def test_storage_and_presigned_url_flow(

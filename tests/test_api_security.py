@@ -23,7 +23,7 @@ def _create_user(client: TestClient, username: str, password: str, role: str) ->
 def test_anonymous_requests_cannot_access_admin_surfaces(client: TestClient) -> None:
     protected_paths = [
         "/api/v1/services",
-        "/api/v1/services/hello-service/logs",
+        "/api/v1/services/secret-service/logs",
         "/api/v1/platform/config",
         "/api/v1/platform/services",
         "/api/v1/storage/buckets",
@@ -55,7 +55,7 @@ def test_viewer_can_read_platform_config_but_not_platform_internals(
 def test_viewer_cannot_access_service_logs(client: TestClient) -> None:
     viewer_token = _create_user(client, "viewer-logs", "pass", "viewer")
     response = client.get(
-        "/api/v1/services/hello-service/logs",
+        "/api/v1/services/secret-service/logs",
         headers={"Authorization": f"Bearer {viewer_token}"},
     )
     assert response.status_code == 403

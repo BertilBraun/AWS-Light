@@ -49,7 +49,7 @@ def compose_stack() -> Iterator[None]:
     if not _integration_enabled():
         pytest.skip("Set AWS_LIGHT_INTEGRATION=1 to run Docker Compose integration tests")
 
-    _run(["docker", "build", "-t", "aws-light/hello-service:latest", "examples/hello-service"])
+    _run(["docker", "build", "-t", "aws-light/secret-service:latest", "examples/secret-service"])
     _run(["docker", "compose", "up", "-d", "--build"], timeout=300)
     _wait_for_api()
     yield

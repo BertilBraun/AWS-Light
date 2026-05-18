@@ -10,26 +10,26 @@ from fastapi.responses import JSONResponse
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    port = int(os.environ.get('PORT', '8000'))
-    _log('startup', port=port)
+    port = int(os.environ.get("PORT", "8000"))
+    _log("startup", port=port)
     yield
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-@app.middleware('http')
+@app.middleware("http")
 async def log_requests(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     started = time.perf_counter()
-    assert request.client is not None, 'Request client is None'
+    assert request.client is not None, "Request client is None"
     response = await call_next(request)
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-    if request.url.path != '/health' or response.status_code >= 400:
+    if request.url.path != "/health" or response.status_code >= 400:
         _log(
-            'request',
+            "request",
             method=request.method,
             path=request.url.path,
             client=request.client.host,
@@ -39,16 +39,17 @@ async def log_requests(
     return response
 
 
-@app.get('/health')
+@app.get("/health")
 def health() -> dict[str, str]:
-    return {'status': 'ok'}
+    return {"status": "ok"}
 
 
-@app.get('/')
+@app.get("/")
 def root() -> dict[str, str]:
     return {
-        'my_secret': os.environ.get('MY_SECRET', '<not set>'),
-        'another_secret': os.environ.get('ANOTHER_SECRET', '<not set>'),
+        "service": "secret-service",
+        "my_secret": os.environ.get("MY_SECRET", "<not set>"),
+        "another_secret": os.environ.get("ANOTHER_SECRET", "<not set>"),
     }
 
 
@@ -56,7 +57,7 @@ def root() -> dict[str, str]:
 def not_found(_request: object, _exc: object) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
-        content={'error': 'not found'},
+        content={"error": "not found"},
     )
 
 
@@ -66,8 +67,8 @@ def _log(event: str, **fields: object) -> None:
     print(
         json.dumps(
             {
-                'ts': datetime.now(timezone.utc).isoformat(),
-                'event': event,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "event": event,
                 **fields,
             }
         ),
@@ -75,8 +76,8 @@ def _log(event: str, **fields: object) -> None:
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get('PORT', '8000'))
-    uvicorn.run(app, host='0.0.0.0', port=port, access_log=False)
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, access_log=False)
