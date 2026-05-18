@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     container_ip_poll_retries: int = 10
 
     # ── CPU stats (orchestrator → Redis) ─────────────────────────────────────
-    cpu_stats_interval_seconds: int = 30
+    cpu_stats_interval_seconds: int = 10
 
     # ── Health checker ────────────────────────────────────────────────────────
     health_check_interval_seconds: int = 10
@@ -56,13 +56,13 @@ class Settings(BaseSettings):
     health_check_read_timeout: float = 5.0
 
     # ── Autoscaler ────────────────────────────────────────────────────────────
-    autoscaler_interval_seconds: int = 30
+    autoscaler_interval_seconds: int = 10
     autoscaler_cpu_scale_up_threshold: float = 70.0
     autoscaler_rps_scale_up_threshold: float = 100.0
     autoscaler_cpu_scale_down_threshold: float = 20.0
     autoscaler_rps_scale_down_threshold: float = 10.0
     # How many consecutive scale-down evaluations before the replica count drops.
-    autoscaler_scale_down_consecutive_checks: int = 3
+    autoscaler_scale_down_consecutive_checks: int = 2
 
     def ensure_data_directories(self) -> None:
         for directory in [
