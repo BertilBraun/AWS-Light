@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from aws_light.iac.applier import Applier
+from aws_light.proxy.redis_routing_table import RedisRoutingTable
 from aws_light.secrets.secrets_manager import SecretsManager
 from aws_light.storage.presigned import PresignedUrlService
 from aws_light.storage.storage_service import StorageService
@@ -70,3 +71,7 @@ def get_event_bus() -> Any:
 def get_redis_client() -> Any:
     assert _redis_client is not None
     return _redis_client
+
+
+def get_routing_table() -> RedisRoutingTable:
+    return RedisRoutingTable(get_redis_client())

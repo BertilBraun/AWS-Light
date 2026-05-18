@@ -88,6 +88,7 @@ async def test_scale_up_when_cpu_above_threshold(
         "autoscale.triggered",
     ]
     assert events[0].payload["scale_up_candidate"] is True
+    assert events[0].payload["decision"] == "scale_up"
     assert events[1].payload["average_cpu_percent"] == (
         settings.autoscaler_cpu_scale_up_threshold + 1
     )
@@ -107,6 +108,8 @@ async def test_scale_up_clamps_at_max_replicas(
     updated = await service_store.get("svc")
     assert updated is not None
     assert updated.spec.replicas == 5
+    events = await autoscaler._event_bus.get_recent_events()
+    assert events[0].payload["decision"] == "hold_at_max"
 
 
 async def test_scale_down_requires_consecutive_checks(
@@ -133,6 +136,8 @@ async def test_scale_down_requires_consecutive_checks(
     scaled_down = await service_store.get("svc")
     assert scaled_down is not None
     assert scaled_down.spec.replicas == 2
+    events = await autoscaler._event_bus.get_recent_events()
+    assert events[-2].payload["decision"] == "scale_down"
 
 
 async def test_scale_down_clamps_at_min_replicas(

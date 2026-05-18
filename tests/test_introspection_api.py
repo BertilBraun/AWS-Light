@@ -9,6 +9,7 @@ from aws_light.models.common import ResourceStatus
 from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.node import NodeSpec, NodeState, ResourceUsage
 from aws_light.models.service import ReplicaState, ServiceSpec, ServiceState
+from aws_light.proxy.routing_table import ReplicaEndpoint
 
 
 def _auth_headers(client: TestClient) -> dict[str, str]:
@@ -28,8 +29,8 @@ async def _seed_introspection_state() -> None:
 
     service = ServiceState(
         spec=ServiceSpec(
-            name="hello-service",
-            image="aws-light/hello-service:latest",
+            name="secret-service",
+            image="aws-light/secret-service:latest",
             replicas=2,
             cpu_request=0.2,
             memory_request_mb=128,
@@ -43,17 +44,28 @@ async def _seed_introspection_state() -> None:
                 node_id="node-00",
                 status=ResourceStatus.RUNNING,
                 container_ip="10.0.0.10",
-                image="aws-light/hello-service:latest",
+                image="aws-light/secret-service:latest",
                 started_at=datetime.utcnow(),
             )
         ],
     )
-    await deps.get_service_store().put("hello-service", service)
+    await deps.get_service_store().put("secret-service", service)
+    await deps.get_routing_table().update_service(
+        "secret-service",
+        [
+            ReplicaEndpoint(
+                replica_id="replica-1",
+                host="10.0.0.10",
+                port=8000,
+                healthy=True,
+            )
+        ],
+    )
     await deps.get_event_bus().publish(
         WebSocketEvent(
             kind=EventKind.SERVICE_UPDATED,
             payload={
-                "service_name": "hello-service",
+                "service_name": "secret-service",
                 "status": "degraded",
                 "replica_count": 1,
             },
@@ -71,7 +83,7 @@ def test_overview_summarizes_cluster_state(client: TestClient) -> None:
     assert payload["services"]["desired_replicas"] == 2
     assert payload["services"]["actual_replicas"] == 1
     assert payload["nodes"]["cpu_used"] == 0.2
-    assert payload["warnings"] == ["hello-service has 1/2 running replicas"]
+    assert payload["warnings"] == ["secret-service has 1/2 running replicas"]
 
 
 def test_service_diagnostics_returns_placement_events_and_warnings(
@@ -79,7 +91,7 @@ def test_service_diagnostics_returns_placement_events_and_warnings(
 ) -> None:
     client.portal.call(_seed_introspection_state)
     response = client.get(
-        "/api/v1/services/hello-service/diagnostics",
+        "/api/v1/services/secret-service/diagnostics",
         headers=_auth_headers(client),
     )
 
@@ -87,7 +99,18 @@ def test_service_diagnostics_returns_placement_events_and_warnings(
     payload = response.json()
     assert payload["desired_replicas"] == 2
     assert payload["actual_replicas"] == 1
+    assert payload["routeable_replicas"] == 1
     assert payload["node_placement"][0]["node_id"] == "node-00"
+    assert payload["node_placement"][0]["routed"] is True
+    assert payload["routing_endpoints"] == [
+        {
+            "replica_id": "replica-1",
+            "host": "10.0.0.10",
+            "port": 8000,
+            "healthy": True,
+            "observed_replica": True,
+        }
+    ]
     assert payload["recent_events"][0]["kind"] == "service.updated"
     assert payload["warnings"] == ["Only 1/2 desired replicas are running"]
 
@@ -104,18 +127,20 @@ def test_topology_returns_platform_service_replica_and_node_graph(
     edge_pairs = {(edge["source"], edge["target"]) for edge in payload["edges"]}
 
     assert "proxy" in node_ids
-    assert "service:hello-service" in node_ids
+    assert "service:secret-service" in node_ids
     assert "replica:replica-1" in node_ids
     assert "node:node-00" in node_ids
-    assert ("proxy", "service:hello-service") in edge_pairs
+    assert ("proxy", "service:secret-service") in edge_pairs
     assert ("replica:replica-1", "node:node-00") in edge_pairs
+    assert ("redis-routing", "replica:replica-1") in edge_pairs
+    assert ("proxy", "replica:replica-1") in edge_pairs
 
 
 def test_introspection_requires_auth(client: TestClient) -> None:
     for path in [
         "/api/v1/overview",
         "/api/v1/platform/topology",
-        "/api/v1/services/hello-service/diagnostics",
+        "/api/v1/services/secret-service/diagnostics",
     ]:
         response = client.get(path)
         assert response.status_code in {401, 403}
@@ -124,17 +149,40 @@ def test_introspection_requires_auth(client: TestClient) -> None:
 async def _seed_platform_metrics_and_events() -> None:
     redis = deps.get_redis_client()
     redis.values["proxy:requests:total"] = "3"
-    redis.hashes["proxy:requests:service"] = {"hello-service": "3"}
+    redis.hashes["proxy:requests:service"] = {"secret-service": "3"}
     redis.hashes["proxy:responses:status"] = {"200": "2", "502": "1"}
     redis.hashes["proxy:failures"] = {"upstream_unreachable": "1"}
+    redis.hashes["proxy:ts:requests:100"] = {"secret-service": "2"}
+    redis.hashes["proxy:ts:errors:100"] = {"secret-service": "1"}
+    redis.hashes["proxy:ts:status:100"] = {"200": "1", "502": "1"}
+    redis.hashes["proxy:ts:latency_sum:100"] = {"secret-service": "3000"}
+    redis.hashes["proxy:ts:latency_count:100"] = {"secret-service": "2"}
     await deps.get_event_bus().publish(
         WebSocketEvent(
             kind=EventKind.AUTOSCALE_EVALUATED,
             payload={
-                "service_name": "hello-service",
+                "service_name": "secret-service",
                 "current_replicas": 2,
                 "average_cpu_percent": 1.5,
                 "requests_per_second": 42.0,
+                "decision": "hold",
+            },
+        )
+    )
+    await deps.get_event_bus().publish(
+        WebSocketEvent(
+            kind=EventKind.PLATFORM_STARTED,
+            payload={"component": "proxy", "port": 8080},
+        )
+    )
+    await deps.get_event_bus().publish(
+        WebSocketEvent(
+            kind=EventKind.PROXY_REQUEST_FAILED,
+            payload={
+                "service_name": "secret-service",
+                "status_code": 502,
+                "failure_reason": "upstream_unreachable",
+                "duration_ms": 4.0,
             },
         )
     )
@@ -147,6 +195,12 @@ async def _seed_platform_metrics_and_events() -> None:
             },
         )
     )
+    await deps.get_event_bus().publish(
+        WebSocketEvent(
+            kind=EventKind.NODE_UPDATED,
+            payload={"node_id": "node-00", "cpu_used": 0.1},
+        )
+    )
 
 
 def test_platform_metrics_exposes_proxy_counters(client: TestClient) -> None:
@@ -156,16 +210,59 @@ def test_platform_metrics_exposes_proxy_counters(client: TestClient) -> None:
     assert response.status_code == 200
     assert response.json()["proxy"] == {
         "requests_total": 3,
-        "requests_by_service": {"hello-service": 3},
+        "requests_by_service": {"secret-service": 3},
         "responses_by_status": {"200": 2, "502": 1},
         "failures": {"upstream_unreachable": 1},
+    }
+
+
+def test_platform_routing_exposes_registered_endpoints(client: TestClient) -> None:
+    client.portal.call(_seed_introspection_state)
+    response = client.get("/api/v1/platform/routing", headers=_auth_headers(client))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "services": [
+            {
+                "service": "secret-service",
+                "endpoints": [
+                    {
+                        "replica_id": "replica-1",
+                        "host": "10.0.0.10",
+                        "port": 8000,
+                        "healthy": True,
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_platform_timeseries_exposes_proxy_buckets(client: TestClient) -> None:
+    client.portal.call(_seed_platform_metrics_and_events)
+    response = client.get("/api/v1/platform/timeseries", headers=_auth_headers(client))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "bucket_seconds": 10,
+        "buckets": [
+            {
+                "bucket": 100,
+                "requests_total": 2,
+                "errors_total": 1,
+                "requests_by_service": {"secret-service": 2},
+                "errors_by_service": {"secret-service": 1},
+                "responses_by_status": {"200": 1, "502": 1},
+                "avg_latency_ms_by_service": {"secret-service": 15.0},
+            }
+        ],
     }
 
 
 def test_platform_events_can_filter_by_component_and_service(client: TestClient) -> None:
     client.portal.call(_seed_platform_metrics_and_events)
     response = client.get(
-        "/api/v1/platform/events?component=autoscaler&service=hello-service",
+        "/api/v1/platform/events?component=autoscaler&service=secret-service",
         headers=_auth_headers(client),
     )
 
@@ -173,3 +270,25 @@ def test_platform_events_can_filter_by_component_and_service(client: TestClient)
     events = response.json()["events"]
     assert len(events) == 1
     assert events[0]["kind"] == "autoscale.evaluated"
+
+
+def test_platform_events_omit_routine_node_updates(client: TestClient) -> None:
+    client.portal.call(_seed_platform_metrics_and_events)
+    response = client.get("/api/v1/platform/events", headers=_auth_headers(client))
+
+    assert response.status_code == 200
+    assert "node.updated" not in [event["kind"] for event in response.json()["events"]]
+
+
+def test_platform_events_can_filter_component_startup(client: TestClient) -> None:
+    client.portal.call(_seed_platform_metrics_and_events)
+    response = client.get(
+        "/api/v1/platform/events?component=proxy",
+        headers=_auth_headers(client),
+    )
+
+    assert response.status_code == 200
+    assert [event["kind"] for event in response.json()["events"]] == [
+        "proxy.request_failed",
+        "platform.started",
+    ]

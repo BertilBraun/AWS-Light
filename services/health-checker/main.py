@@ -9,6 +9,7 @@ import redis.asyncio as aioredis
 import aws_light.log as log
 from aws_light.config import settings
 from aws_light.events.redis_event_bus import RedisEventBus
+from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.service import ServiceState
 from aws_light.proxy.health_checker import HealthChecker
 from aws_light.proxy.redis_routing_table import RedisRoutingTable
@@ -36,6 +37,18 @@ async def main() -> None:
 
     await checker.start()
     logger.info("Health checker started — interval %ds", settings.health_check_interval_seconds)
+
+    await event_bus.publish(
+        WebSocketEvent(
+            kind=EventKind.PLATFORM_STARTED,
+            payload={
+                "component": "health-checker",
+                "interval_seconds": settings.health_check_interval_seconds,
+                "success_threshold": settings.health_check_success_threshold,
+                "failure_threshold": settings.health_check_failure_threshold,
+            },
+        )
+    )
 
     try:
         await asyncio.Event().wait()

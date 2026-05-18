@@ -9,6 +9,7 @@ from aws_light.models.events import WebSocketEvent
 
 _STREAM_KEY = "events"
 _STREAM_MAXLEN = 1000
+_RECENT_EVENT_COUNT = 500
 _BLOCK_TIMEOUT_MS = 30_000
 
 
@@ -41,7 +42,7 @@ class RedisEventBus:
 
     async def get_recent_events(self) -> list[WebSocketEvent]:
         try:
-            entries = await self._redis.xrange(_STREAM_KEY, count=100)
+            entries = await self._redis.xrevrange(_STREAM_KEY, count=_RECENT_EVENT_COUNT)
         except Exception:
             return []
         events = []
@@ -49,7 +50,7 @@ class RedisEventBus:
             raw = fields.get(b"event") or fields.get("event")
             if raw is not None:
                 events.append(WebSocketEvent.model_validate_json(raw))
-        return events
+        return list(reversed(events))
 
     async def _current_stream_id(self) -> str:
         try:

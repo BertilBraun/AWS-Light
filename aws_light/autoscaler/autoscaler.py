@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from aws_light.autoscaler.metrics_collector import MetricsCollector
+from aws_light.autoscaler.metrics_collector import MetricsCollector, ServiceMetrics
 from aws_light.config import settings
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.models.events import EventKind, WebSocketEvent
@@ -25,6 +25,7 @@ class Autoscaler:
         self._metrics_collector = metrics_collector
         self._event_bus = event_bus
         self._scale_down_counters: dict[str, int] = {}
+        self._last_evaluation_decisions: dict[str, str] = {}
         self._running = False
 
     async def start(self) -> None:
@@ -63,24 +64,13 @@ class Autoscaler:
             metrics.average_cpu_percent < settings.autoscaler_cpu_scale_down_threshold
             and metrics.requests_per_second < settings.autoscaler_rps_scale_down_threshold
         )
-        await self._event_bus.publish(
-            WebSocketEvent(
-                kind=EventKind.AUTOSCALE_EVALUATED,
-                payload={
-                    "service_name": spec.name,
-                    "current_replicas": current_replicas,
-                    "min_replicas": spec.min_replicas,
-                    "max_replicas": spec.max_replicas,
-                    "average_cpu_percent": metrics.average_cpu_percent,
-                    "requests_per_second": metrics.requests_per_second,
-                    "scale_up_threshold_cpu": settings.autoscaler_cpu_scale_up_threshold,
-                    "scale_up_threshold_rps": settings.autoscaler_rps_scale_up_threshold,
-                    "scale_down_threshold_cpu": settings.autoscaler_cpu_scale_down_threshold,
-                    "scale_down_threshold_rps": settings.autoscaler_rps_scale_down_threshold,
-                    "scale_up_candidate": scale_up,
-                    "scale_down_candidate": scale_down_candidate,
-                },
-            )
+        decision = self._autoscale_decision(service_state, scale_up, scale_down_candidate)
+        await self._publish_evaluation_if_changed(
+            service_state=service_state,
+            metrics=metrics,
+            scale_up=scale_up,
+            scale_down_candidate=scale_down_candidate,
+            decision=decision,
         )
 
         if scale_up and current_replicas < spec.max_replicas:
@@ -96,6 +86,61 @@ class Autoscaler:
                 await self._apply_scale(service_state, new_replica_count, "scale_down", metrics)
         else:
             self._scale_down_counters.pop(spec.name, None)
+
+    async def _publish_evaluation_if_changed(
+        self,
+        service_state: ServiceState,
+        metrics: ServiceMetrics,
+        scale_up: bool,
+        scale_down_candidate: bool,
+        decision: str,
+    ) -> None:
+        spec = service_state.spec
+        previous = self._last_evaluation_decisions.get(spec.name)
+        if previous == decision:
+            return
+        self._last_evaluation_decisions[spec.name] = decision
+        await self._event_bus.publish(
+            WebSocketEvent(
+                kind=EventKind.AUTOSCALE_EVALUATED,
+                payload={
+                    "service_name": spec.name,
+                    "current_replicas": spec.replicas,
+                    "min_replicas": spec.min_replicas,
+                    "max_replicas": spec.max_replicas,
+                    "average_cpu_percent": metrics.average_cpu_percent,
+                    "requests_per_second": metrics.requests_per_second,
+                    "scale_up_threshold_cpu": settings.autoscaler_cpu_scale_up_threshold,
+                    "scale_up_threshold_rps": settings.autoscaler_rps_scale_up_threshold,
+                    "scale_down_threshold_cpu": settings.autoscaler_cpu_scale_down_threshold,
+                    "scale_down_threshold_rps": settings.autoscaler_rps_scale_down_threshold,
+                    "scale_up_candidate": scale_up,
+                    "scale_down_candidate": scale_down_candidate,
+                    "decision": decision,
+                },
+            )
+        )
+
+    def _autoscale_decision(
+        self,
+        service_state: ServiceState,
+        scale_up: bool,
+        scale_down_candidate: bool,
+    ) -> str:
+        spec = service_state.spec
+        if scale_up and spec.replicas < spec.max_replicas:
+            return "scale_up"
+        if scale_up:
+            return "hold_at_max"
+        if scale_down_candidate and spec.replicas > spec.min_replicas:
+            consecutive = self._scale_down_counters.get(spec.name, 0) + 1
+            required = settings.autoscaler_scale_down_consecutive_checks
+            if consecutive >= required:
+                return "scale_down"
+            return f"wait_scale_down_{consecutive}_of_{required}"
+        if scale_down_candidate:
+            return "hold_at_min"
+        return "hold"
 
     async def _apply_scale(
         self,

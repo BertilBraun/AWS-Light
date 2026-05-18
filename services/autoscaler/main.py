@@ -11,6 +11,7 @@ from aws_light.autoscaler.autoscaler import Autoscaler
 from aws_light.autoscaler.metrics_collector import MetricsCollector
 from aws_light.config import settings
 from aws_light.events.redis_event_bus import RedisEventBus
+from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.service import ServiceState
 from aws_light.store.postgres_store import PostgresStore
 
@@ -37,6 +38,16 @@ async def main() -> None:
 
     await autoscaler.start()
     logger.info("Autoscaler started — interval %ds", settings.autoscaler_interval_seconds)
+
+    await event_bus.publish(
+        WebSocketEvent(
+            kind=EventKind.PLATFORM_STARTED,
+            payload={
+                "component": "autoscaler",
+                "interval_seconds": settings.autoscaler_interval_seconds,
+            },
+        )
+    )
 
     try:
         await asyncio.Event().wait()

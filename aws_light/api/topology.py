@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from aws_light.dependencies import get_node_store, get_service_store
+from aws_light.dependencies import get_node_store, get_routing_table, get_service_store
 from aws_light.iam.middleware import get_current_user
 from aws_light.models.iam import UserSpec
 
@@ -13,6 +13,11 @@ router = APIRouter(prefix="/api/v1/platform/topology", tags=["platform"])
 async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, object]:
     services = await get_service_store().list()
     nodes = await get_node_store().list()
+    routing_table = get_routing_table()
+    routed_endpoints_by_service = {
+        service_name: await routing_table.get_endpoints(service_name)
+        for service_name in await routing_table.all_service_names()
+    }
 
     graph_nodes = [
         _node("client", "Client", "external"),
@@ -48,8 +53,12 @@ async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, obj
                 "node",
                 {
                     "cpu_used": node_state.usage.cpu_used,
+                    "cpu_reserved": node_state.usage.cpu_used,
+                    "cpu_actual": node_state.actual_usage.cpu_used,
                     "cpu_capacity": node_state.spec.cpu_capacity,
                     "memory_used_mb": node_state.usage.memory_used_mb,
+                    "memory_reserved_mb": node_state.usage.memory_used_mb,
+                    "memory_actual_mb": node_state.actual_usage.memory_used_mb,
                     "memory_capacity_mb": node_state.spec.memory_capacity_mb,
                 },
             )
@@ -72,9 +81,14 @@ async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, obj
         graph_edges.append(_edge("proxy", service_id, "routes requests"))
         graph_edges.append(_edge("health-checker", service_id, "checks health"))
         graph_edges.append(_edge("autoscaler", service_id, "adjusts desired replicas"))
+        routed_by_replica = {
+            endpoint.replica_id: endpoint
+            for endpoint in routed_endpoints_by_service.get(service.spec.name, [])
+        }
 
         for replica in service.replicas:
             replica_id = f"replica:{replica.replica_id}"
+            routing_endpoint = routed_by_replica.get(replica.replica_id)
             graph_nodes.append(
                 _node(
                     replica_id,
@@ -84,11 +98,27 @@ async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, obj
                         "service": service.spec.name,
                         "status": replica.status.value,
                         "container_ip": replica.container_ip,
+                        "routed": routing_endpoint is not None,
+                        "route_healthy": routing_endpoint.healthy if routing_endpoint else False,
                     },
                 )
             )
             graph_edges.append(_edge(service_id, replica_id, "owns replica"))
-            graph_edges.append(_edge("proxy", replica_id, "forwards traffic"))
+            if routing_endpoint is not None:
+                graph_edges.append(
+                    _edge(
+                        "redis-routing",
+                        replica_id,
+                        "registered endpoint",
+                        {
+                            "host": routing_endpoint.host,
+                            "port": routing_endpoint.port,
+                            "healthy": routing_endpoint.healthy,
+                        },
+                    )
+                )
+                if routing_endpoint.healthy:
+                    graph_edges.append(_edge("proxy", replica_id, "forwards traffic"))
             graph_edges.append(_edge(replica_id, f"node:{replica.node_id}", "scheduled on"))
 
     return {"nodes": graph_nodes, "edges": graph_edges}
@@ -108,5 +138,10 @@ def _node(
     }
 
 
-def _edge(source: str, target: str, label: str) -> dict[str, str]:
-    return {"source": source, "target": target, "label": label}
+def _edge(
+    source: str,
+    target: str,
+    label: str,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {"source": source, "target": target, "label": label, "metadata": metadata or {}}

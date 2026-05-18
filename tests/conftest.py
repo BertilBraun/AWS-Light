@@ -38,11 +38,21 @@ class FakeRedis:
         self.values: dict[str, str] = {}
         self.hashes: dict[str, dict[str, str]] = {}
 
+    async def set(self, key: str, value: object) -> None:
+        self.values[key] = str(value)
+
     async def get(self, key: str) -> str | None:
         return self.values.get(key)
 
     async def hgetall(self, key: str) -> dict[str, str]:
         return self.hashes.get(key, {})
+
+    async def keys(self, pattern: str) -> list[str]:
+        all_keys = set(self.values) | set(self.hashes)
+        if pattern.endswith("*"):
+            prefix = pattern[:-1]
+            return [key for key in all_keys if key.startswith(prefix)]
+        return [key for key in all_keys if key == pattern]
 
 
 @asynccontextmanager

@@ -5,11 +5,17 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from aws_light.compute.docker_client import DockerClient
-from aws_light.dependencies import get_event_bus, get_node_store, get_service_store
+from aws_light.dependencies import (
+    get_event_bus,
+    get_node_store,
+    get_routing_table,
+    get_service_store,
+)
 from aws_light.iam.middleware import get_current_user, require_role
 from aws_light.models.common import ResourceStatus
 from aws_light.models.iam import Role, UserSpec
 from aws_light.models.service import ServiceSpec, ServiceState
+from aws_light.proxy.routing_table import ReplicaEndpoint
 
 router = APIRouter(prefix="/api/v1/services", tags=["services"])
 
@@ -92,7 +98,15 @@ async def get_service_diagnostics(
     running_replicas = [
         replica for replica in service_state.replicas if replica.status == ResourceStatus.RUNNING
     ]
-    warnings = _service_warnings(service_state, nodes)
+    routing_endpoints = await get_routing_table().get_endpoints(name)
+    routing_by_replica = {endpoint.replica_id: endpoint for endpoint in routing_endpoints}
+    observed_replica_ids = {replica.replica_id for replica in service_state.replicas}
+    routeable_replicas = [
+        endpoint
+        for endpoint in routing_endpoints
+        if endpoint.healthy and endpoint.replica_id in observed_replica_ids
+    ]
+    warnings = _service_warnings(service_state, nodes, routing_endpoints)
 
     return {
         "service": service_state.model_dump(mode="json"),
@@ -100,6 +114,7 @@ async def get_service_diagnostics(
         "actual_replicas": len(running_replicas),
         "healthy_replicas": len(running_replicas),
         "unhealthy_replicas": len(service_state.replicas) - len(running_replicas),
+        "routeable_replicas": len(routeable_replicas),
         "node_placement": [
             {
                 "node_id": replica.node_id,
@@ -107,8 +122,22 @@ async def get_service_diagnostics(
                 "status": replica.status.value,
                 "container_ip": replica.container_ip,
                 "node_known": replica.node_id in nodes,
+                "routed": replica.replica_id in routing_by_replica,
+                "route_healthy": routing_by_replica.get(replica.replica_id).healthy
+                if replica.replica_id in routing_by_replica
+                else False,
             }
             for replica in service_state.replicas
+        ],
+        "routing_endpoints": [
+            {
+                "replica_id": endpoint.replica_id,
+                "host": endpoint.host,
+                "port": endpoint.port,
+                "healthy": endpoint.healthy,
+                "observed_replica": endpoint.replica_id in observed_replica_ids,
+            }
+            for endpoint in routing_endpoints
         ],
         "recent_events": related_events,
         "warnings": warnings,
@@ -135,8 +164,14 @@ async def update_service(
 def _service_warnings(
     service_state: ServiceState,
     nodes: dict[str, object],
+    routing_endpoints: list[ReplicaEndpoint] | None = None,
 ) -> list[str]:
     warnings = []
+    routing_endpoints = routing_endpoints or []
+    routed_replica_ids = {endpoint.replica_id for endpoint in routing_endpoints}
+    healthy_routed_replica_ids = {
+        endpoint.replica_id for endpoint in routing_endpoints if endpoint.healthy
+    }
     desired = service_state.spec.replicas
     running = sum(
         1 for replica in service_state.replicas if replica.status == ResourceStatus.RUNNING
@@ -153,6 +188,19 @@ def _service_warnings(
             warnings.append(f"Replica {replica.replica_id[:8]} has no container IP")
         if replica.status != ResourceStatus.RUNNING:
             warnings.append(f"Replica {replica.replica_id[:8]} is {replica.status.value}")
+        if (
+            replica.status == ResourceStatus.RUNNING
+            and replica.replica_id not in routed_replica_ids
+        ):
+            warnings.append(f"Replica {replica.replica_id[:8]} is not in the routing table")
+
+    observed_replica_ids = {replica.replica_id for replica in service_state.replicas}
+    for endpoint in routing_endpoints:
+        if endpoint.replica_id not in observed_replica_ids:
+            warnings.append(f"Routing table references unknown replica {endpoint.replica_id[:8]}")
+
+    if running > 0 and not healthy_routed_replica_ids:
+        warnings.append("No healthy routing endpoints are available")
     return warnings
 
 

@@ -15,6 +15,7 @@ from aws_light.compute.scheduler import create_scheduler
 from aws_light.config import settings
 from aws_light.events.redis_event_bus import RedisEventBus
 from aws_light.models.deployment import RolloutState
+from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.node import NodeState
 from aws_light.models.secret import SecretSpec
 from aws_light.models.service import ServiceState
@@ -73,6 +74,17 @@ async def main() -> None:
         "Orchestrator started — reconcile interval %ds, scheduler=%s",
         settings.reconcile_interval_seconds,
         settings.scheduler_policy,
+    )
+
+    await event_bus.publish(
+        WebSocketEvent(
+            kind=EventKind.PLATFORM_STARTED,
+            payload={
+                "component": "orchestrator",
+                "reconcile_interval_seconds": settings.reconcile_interval_seconds,
+                "scheduler_policy": settings.scheduler_policy,
+            },
+        )
     )
 
     try:

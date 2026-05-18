@@ -3,67 +3,171 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AWS Light Dashboard</title>
+  <title>AWS Light Admin</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <header>
-    <h1>&#9729; AWS Light</h1>
-    <span id="connection-status" class="disconnected">disconnected</span>
+  <header class="topbar">
+    <div class="brand">AWS Light</div>
+    <nav class="tabs" aria-label="Dashboard views">
+      <button id="overview-tab" class="tab active" data-view="overview">Overview</button>
+      <button class="tab" data-view="services">Services</button>
+      <button class="tab" data-view="traffic">Traffic</button>
+      <button id="topology-tab" class="tab" data-view="topology">Topology</button>
+      <button class="tab" data-view="platform">Platform</button>
+    </nav>
+    <div id="connection-status" class="status-pill disconnected">offline</div>
+    <button id="refresh-button" class="icon-button" title="Refresh" aria-label="Refresh">R</button>
   </header>
 
   <main>
-    <section id="platform-section">
-      <h2>Platform Services <span class="hint">click a row to inspect logs</span></h2>
-      <table id="platform-table">
-        <thead>
-          <tr>
-            <th>Service</th>
-            <th>Status</th>
-            <th>Health</th>
-            <th>Role</th>
-            <th>Ports</th>
-          </tr>
-        </thead>
-        <tbody id="platform-body"></tbody>
-      </table>
-      <div id="platform-detail-panel" hidden></div>
+    <section id="login-view" class="login-panel" hidden>
+      <form id="login-form" class="login-form">
+        <h1>Admin Login</h1>
+        <label>
+          Username
+          <input id="username" name="username" autocomplete="username" value="admin" />
+        </label>
+        <label>
+          Password
+          <input id="password" name="password" type="password" autocomplete="current-password" value="admin" />
+        </label>
+        <button type="submit">Sign in</button>
+        <div id="login-error" class="error-text" hidden></div>
+      </form>
     </section>
 
-    <section id="nodes-section">
-      <h2>Nodes <span id="platform-config" class="hint"></span></h2>
-      <div id="node-grid"></div>
+    <section id="overview-view" class="view">
+      <section class="summary-strip" aria-label="Cluster summary">
+        <div class="summary-item">
+          <span>Services</span>
+          <strong id="summary-services">-</strong>
+        </div>
+        <div class="summary-item">
+          <span>Replicas</span>
+          <strong id="summary-replicas">-</strong>
+        </div>
+        <div class="summary-item">
+          <span>CPU</span>
+          <strong id="summary-cpu">-</strong>
+        </div>
+        <div class="summary-item">
+          <span>Memory</span>
+          <strong id="summary-memory">-</strong>
+        </div>
+        <div class="summary-item">
+          <span>Scheduler</span>
+          <strong id="summary-scheduler">-</strong>
+        </div>
+      </section>
+
+      <section id="warnings-panel" class="warning-band" hidden></section>
+
+      <section class="workspace overview-workspace">
+        <section class="pane">
+          <div class="pane-header">
+            <h2>Service Health</h2>
+            <span id="overview-services-count" class="muted"></span>
+          </div>
+          <div id="overview-services" class="overview-list"></div>
+          <div id="overview-service-detail" class="detail-panel overview-detail" hidden></div>
+        </section>
+
+        <section class="pane pane-resizable">
+          <div class="pane-header">
+            <h2>Nodes</h2>
+            <span id="nodes-count" class="muted"></span>
+          </div>
+          <div id="node-grid" class="node-grid"></div>
+        </section>
+
+        <section class="pane pane-resizable">
+          <div class="pane-header">
+            <h2>Activity</h2>
+            <span id="event-count" class="muted"></span>
+          </div>
+          <ol id="event-log" class="event-log"></ol>
+        </section>
+      </section>
     </section>
 
-    <section id="services-section">
-      <h2>Services <span class="hint">click a row to inspect</span></h2>
-      <table id="services-table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Image</th>
-            <th>Status</th>
-            <th>Replicas</th>
-          </tr>
-        </thead>
-        <tbody id="services-body"></tbody>
-      </table>
-      <div id="detail-panel" hidden></div>
+    <section id="services-view" class="view" hidden>
+      <section class="split-view">
+        <section class="pane">
+          <div class="pane-header">
+            <h2>Services</h2>
+            <span id="services-count" class="muted"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th>Replicas</th>
+                  <th>Routeable</th>
+                  <th>Max</th>
+                  <th>Image</th>
+                </tr>
+              </thead>
+              <tbody id="services-body"></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="pane">
+          <div class="pane-header">
+            <h2>Service Detail</h2>
+          </div>
+          <div id="service-detail" class="detail-panel standalone" hidden></div>
+        </section>
+      </section>
     </section>
 
-    <section id="secrets-section">
-      <h2>Secrets</h2>
-      <ul id="secrets-list"></ul>
+    <section id="traffic-view" class="view" hidden>
+      <section class="single-view">
+        <section class="pane pane-full">
+          <div class="pane-header">
+            <h2>Proxy Traffic</h2>
+            <span id="traffic-window" class="muted"></span>
+          </div>
+          <div id="traffic-summary" class="traffic-summary"></div>
+          <div id="traffic-chart" class="traffic-chart"></div>
+          <div id="traffic-services" class="traffic-services"></div>
+        </section>
+      </section>
     </section>
 
-    <section id="buckets-section">
-      <h2>Buckets</h2>
-      <ul id="buckets-list"></ul>
+    <section id="topology-view" class="view" hidden>
+      <section class="topology-layout">
+        <div class="topology-canvas-wrap">
+          <svg id="topology-canvas" role="img" aria-label="Platform topology"></svg>
+        </div>
+        <aside class="pane topology-side">
+          <div class="pane-header">
+            <h2>Routing</h2>
+            <span id="routing-count" class="muted"></span>
+          </div>
+          <div id="routing-list" class="routing-list"></div>
+        </aside>
+      </section>
     </section>
 
-    <section id="events-section">
-      <h2>Event Log</h2>
-      <ul id="event-log"></ul>
+    <section id="platform-view" class="view" hidden>
+      <section class="split-view platform-view-layout">
+        <section class="pane">
+          <div class="pane-header">
+            <h2>Platform Internals</h2>
+            <span id="platform-count" class="muted"></span>
+          </div>
+          <div id="platform-list" class="platform-list"></div>
+        </section>
+        <section class="pane">
+          <div class="pane-header">
+            <h2>Component Activity</h2>
+          </div>
+          <div id="platform-detail" class="detail-panel compact" hidden></div>
+        </section>
+      </section>
     </section>
   </main>
 

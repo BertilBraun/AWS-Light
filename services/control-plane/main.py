@@ -30,6 +30,7 @@ from aws_light.iac.applier import Applier
 from aws_light.iac.differ import Differ
 from aws_light.iam.auth import make_default_admin
 from aws_light.models.deployment import RolloutState
+from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.iam import UserSpec
 from aws_light.models.node import NodeState
 from aws_light.models.secret import SecretSpec
@@ -88,6 +89,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await _seed_default_admin(user_store)
     logger.info("Control-plane ready on port %d", settings.api_port)
+    await event_bus.publish(
+        WebSocketEvent(
+            kind=EventKind.PLATFORM_STARTED,
+            payload={"component": "control-plane", "port": settings.api_port},
+        )
+    )
 
     yield
 

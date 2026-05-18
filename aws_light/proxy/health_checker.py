@@ -27,6 +27,7 @@ class HealthChecker:
         self._event_bus = event_bus
         self._consecutive_failures: dict[str, int] = {}
         self._consecutive_successes: dict[str, int] = {}
+        self._routeable_replicas: set[str] = set()
         self._running = False
 
     async def start(self) -> None:
@@ -78,6 +79,19 @@ class HealthChecker:
                 self._consecutive_successes.pop(replica_id, None)
                 self._consecutive_failures.pop(replica_id, None)
                 await self._routing_table.set_healthy(replica_id, True)
+                if replica_id not in self._routeable_replicas:
+                    self._routeable_replicas.add(replica_id)
+                    await self._event_bus.publish(
+                        WebSocketEvent(
+                            kind=EventKind.HEALTH_CHECK_PASSED,
+                            payload={
+                                "replica_id": replica_id,
+                                "service_name": service_name,
+                                "url": url,
+                                "success_threshold": settings.health_check_success_threshold,
+                            },
+                        )
+                    )
                 if had_failures:
                     await self._event_bus.publish(
                         WebSocketEvent(
@@ -93,7 +107,8 @@ class HealthChecker:
             failures = self._consecutive_failures.get(replica_id, 0) + 1
             self._consecutive_failures[replica_id] = failures
             self._consecutive_successes.pop(replica_id, None)
-            if failures >= settings.health_check_failure_threshold:
+            if failures == settings.health_check_failure_threshold:
+                self._routeable_replicas.discard(replica_id)
                 await self._routing_table.set_healthy(replica_id, False)
                 logger.warning(
                     "Replica %s (%s) marked unhealthy after %d consecutive failures",
