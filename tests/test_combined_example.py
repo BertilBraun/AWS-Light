@@ -72,3 +72,11 @@ def test_combined_service_requires_demo_token(monkeypatch) -> None:  # type: ign
 
     assert combined.authorized("demo-secret") is True
     assert combined.authorized("wrong") is False
+
+
+def test_combined_service_accepts_demo_token_query_parameter(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    combined = _load_combined_service()
+    monkeypatch.setenv("COMBINED_API_TOKEN", "demo-secret")
+
+    assert combined.resolve_demo_token("", "demo-secret") == "demo-secret"
+    assert combined.resolve_demo_token("header-secret", "demo-secret") == "header-secret"

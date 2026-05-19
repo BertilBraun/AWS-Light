@@ -16,8 +16,11 @@ def health() -> dict[str, str]:
 
 
 @app.get("/")
-async def aggregate(x_demo_token: str = Header(default="")) -> dict[str, object]:
-    if not authorized(x_demo_token):
+async def aggregate(
+    x_demo_token: str = Header(default=""),
+    demo_token: str = "",
+) -> dict[str, object]:
+    if not authorized(resolve_demo_token(x_demo_token, demo_token)):
         raise HTTPException(status_code=401, detail="invalid demo token")
 
     storage = await exercise_storage()
@@ -36,6 +39,10 @@ async def aggregate(x_demo_token: str = Header(default="")) -> dict[str, object]
 def authorized(token: str) -> bool:
     expected = os.environ.get("COMBINED_API_TOKEN", "")
     return bool(expected) and token == expected
+
+
+def resolve_demo_token(header_token: str, query_token: str) -> str:
+    return header_token or query_token
 
 
 async def exercise_storage() -> dict[str, object]:
