@@ -34,6 +34,7 @@ _ROLLOUT_HEALTH_WAIT_TIMEOUT = 60
 _PROXY_WORKLOAD_URL = "http://proxy:8080"
 _SERVICE_TOKEN_SECRET_PREFIX = "aws-light-service-token-"
 _DATABASE_PASSWORD_SECRET_PREFIX = "aws-light-database-"
+_SERVICE_NETWORK_PLATFORM_SERVICES = {"proxy", "health-checker"}
 
 
 def _node_capacity_payload(node: NodeState) -> dict[str, object]:
@@ -198,6 +199,16 @@ class ComputeOrchestrator:
         for node_state in self._node_manager.get_all_nodes():
             await self._node_store.put(node_state.spec.node_id, node_state)  # type: ignore[union-attr]
 
+    def _ensure_service_network(self, service_name: str) -> str:
+        network_name = _service_network_name(service_name)
+        self._docker_client.ensure_network(network_name)
+        for container in self._docker_client.list_compose_containers():
+            if container.service in _SERVICE_NETWORK_PLATFORM_SERVICES:
+                self._docker_client.connect_container_to_network(
+                    container.container_id, network_name
+                )
+        return network_name
+
     async def _teardown_service(self, service_state: ServiceState) -> None:
         for replica in list(service_state.replicas):
             await self._remove_replica(service_state, replica)
@@ -207,6 +218,7 @@ class ComputeOrchestrator:
 
     async def _reconcile_service(self, service_state: ServiceState) -> None:
         spec = service_state.spec
+        self._ensure_service_network(spec.name)
         service_state = await self._refresh_observed_replicas(service_state)
         running_replicas = [
             replica
@@ -630,6 +642,8 @@ class ComputeOrchestrator:
     async def _attach_service_replica_networks(
         self, service_state: ServiceState, container_id: str
     ) -> None:
+        network_name = self._ensure_service_network(service_state.spec.name)
+        self._docker_client.connect_container_to_network(container_id, network_name)
         database_names = [
             binding.name
             for binding in service_state.spec.resources.databases
@@ -637,9 +651,6 @@ class ComputeOrchestrator:
         ]
         if not database_names:
             return
-        network_name = _service_network_name(service_state.spec.name)
-        self._docker_client.ensure_network(network_name)
-        self._docker_client.connect_container_to_network(container_id, network_name)
         if self._database_store is None:
             return
         for database_name in database_names:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from aws_light.compute.docker_client import ContainerStats
+from aws_light.compute.docker_client import ComposeContainerInfo, ContainerStats
 from aws_light.compute.node_manager import NodeManager
 from aws_light.compute.orchestrator import ComputeOrchestrator
 from aws_light.compute.scheduler import BinPackScheduler
@@ -36,6 +36,7 @@ class FakeDockerClient:
         self.created_labels: list[dict[str, str]] = []
         self.ensured_networks: list[str] = []
         self.network_connections: list[tuple[str, str]] = []
+        self.compose_containers: list[ComposeContainerInfo] = []
 
     def ensure_network(self, network_name: str) -> None:
         self.ensured_networks.append(network_name)
@@ -75,6 +76,11 @@ class FakeDockerClient:
 
     def get_container_stats(self, container_id: str) -> ContainerStats | None:
         return self.stats.get(container_id)
+
+    def list_compose_containers(
+        self, project_name: str = "aws-light"
+    ) -> list[ComposeContainerInfo]:
+        return self.compose_containers
 
 
 class FakeEventBus:
@@ -533,6 +539,76 @@ async def test_bound_service_and_database_join_service_network(tmp_path: Path) -
     assert "aws-light-svc-api" in docker_client.ensured_networks
     assert ("new-container-1", "aws-light-svc-api") in docker_client.network_connections
     assert ("new-container-2", "aws-light-svc-api") in docker_client.network_connections
+
+
+async def test_proxy_and_health_checker_join_service_network(tmp_path: Path) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    docker_client.compose_containers = [
+        ComposeContainerInfo(
+            service="proxy",
+            container_id="proxy-container",
+            name="aws-light-proxy-1",
+            image="aws-light-proxy",
+            status="running",
+            health="",
+            ports=[],
+        ),
+        ComposeContainerInfo(
+            service="health-checker",
+            container_id="health-container",
+            name="aws-light-health-checker-1",
+            image="aws-light-health-checker",
+            status="running",
+            health="",
+            ports=[],
+        ),
+        ComposeContainerInfo(
+            service="autoscaler",
+            container_id="autoscaler-container",
+            name="aws-light-autoscaler-1",
+            image="aws-light-autoscaler",
+            status="running",
+            health="",
+            ports=[],
+        ),
+    ]
+    service = ServiceState(
+        spec=ServiceSpec(
+            name="api",
+            image="example/api:latest",
+            replicas=1,
+            cpu_request=0.2,
+            memory_request_mb=128,
+            port=8000,
+        ),
+        status=ResourceStatus.PENDING,
+        replicas=[],
+    )
+    await service_store.put("api", service)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    assert ("proxy-container", "aws-light-svc-api") in docker_client.network_connections
+    assert ("health-container", "aws-light-svc-api") in docker_client.network_connections
+    assert ("autoscaler-container", "aws-light-svc-api") not in docker_client.network_connections
 
 
 async def test_collect_cpu_stats_updates_actual_node_usage(tmp_path: Path) -> None:
