@@ -48,14 +48,27 @@ class DockerClient:
         except docker.errors.NotFound:
             self._client.networks.create(network_name, driver="bridge")
 
-    def connect_container_to_network(self, container_id: str, network_name: str) -> None:
+    def connect_container_to_network(
+        self, container_id: str, network_name: str, aliases: list[str] | None = None
+    ) -> None:
         try:
             network = self._client.networks.get(network_name)
             container: Container = self._client.containers.get(container_id)
-            network.connect(container)
+            network.connect(container, aliases=aliases)
         except docker.errors.APIError as error:
             if "already exists" not in str(error).lower():
                 raise
+            if aliases:
+                try:
+                    network.disconnect(container)
+                    network.connect(container, aliases=aliases)
+                except docker.errors.APIError as reconnect_error:
+                    logger.warning(
+                        "Could not refresh aliases for container %s on network %s: %s",
+                        container_id[:12],
+                        network_name,
+                        reconnect_error,
+                    )
         except docker.errors.NotFound:
             logger.warning(
                 "Could not connect container %s to missing network %s",

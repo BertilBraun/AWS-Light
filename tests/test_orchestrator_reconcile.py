@@ -41,6 +41,7 @@ class FakeDockerClient:
         self.ensured_networks: list[str] = []
         self.removed_networks: list[str] = []
         self.network_connections: list[tuple[str, str]] = []
+        self.network_connection_aliases: list[tuple[str, str, tuple[str, ...]]] = []
         self.compose_containers: list[ComposeContainerInfo] = []
 
     def ensure_network(self, network_name: str) -> None:
@@ -49,8 +50,13 @@ class FakeDockerClient:
     def remove_network(self, network_name: str) -> None:
         self.removed_networks.append(network_name)
 
-    def connect_container_to_network(self, container_id: str, network_name: str) -> None:
+    def connect_container_to_network(
+        self, container_id: str, network_name: str, aliases: list[str] | None = None
+    ) -> None:
         self.network_connections.append((container_id, network_name))
+        self.network_connection_aliases.append(
+            (container_id, network_name, tuple(aliases or []))
+        )
 
     def container_is_running(self, container_id: str) -> bool:
         return container_id in self.running_containers
@@ -857,6 +863,16 @@ async def test_proxy_and_health_checker_join_service_network(tmp_path: Path) -> 
 
     assert ("proxy-container", "aws-light-svc-api") in docker_client.network_connections
     assert ("health-container", "aws-light-svc-api") in docker_client.network_connections
+    assert (
+        "proxy-container",
+        "aws-light-svc-api",
+        ("proxy",),
+    ) in docker_client.network_connection_aliases
+    assert (
+        "health-container",
+        "aws-light-svc-api",
+        ("health-checker",),
+    ) in docker_client.network_connection_aliases
     assert ("autoscaler-container", "aws-light-svc-api") not in docker_client.network_connections
 
 

@@ -218,7 +218,7 @@ class ComputeOrchestrator:
         for container in self._docker_client.list_compose_containers():
             if container.service in _SERVICE_NETWORK_PLATFORM_SERVICES:
                 self._docker_client.connect_container_to_network(
-                    container.container_id, network_name
+                    container.container_id, network_name, aliases=[container.service]
                 )
         return network_name
 
