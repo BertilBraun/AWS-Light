@@ -1,0 +1,29 @@
+apiVersion: aws-light/v1
+kind: Database
+metadata:
+  name: app-db
+spec:
+  engine: postgres
+  version: "16"
+  storageMb: 512
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: database-service
+spec:
+  image: aws-light/database-service:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 3
+  cpuRequest: 0.1
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  resources:
+    databases:
+      - name: app-db
+        access: [connect]
+  ingress:
+    external: true
+    internal: false
