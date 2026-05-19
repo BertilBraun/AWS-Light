@@ -136,6 +136,7 @@ def create_app(lifespan_override: object = None) -> FastAPI:
     app.include_router(deployments_router.router)
     app.include_router(secrets_router.router)
     app.include_router(storage_router.router)
+    app.include_router(storage_router.workload_router)
     app.include_router(iac_router.router)
     app.include_router(websocket_router.router)
 

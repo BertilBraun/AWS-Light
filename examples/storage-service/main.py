@@ -1,13 +1,14 @@
 import os
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 
 app = FastAPI()
-STORE_ROOT = Path(os.environ.get("STORE_ROOT", "/tmp/aws-light-storage-demo"))
+
+BUCKET_NAME = os.environ.get("AWS_LIGHT_BUCKET_NAME", "demo-objects")
 
 
 class ObjectPayload(BaseModel):
@@ -15,7 +16,7 @@ class ObjectPayload(BaseModel):
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
+async def log_requests(request: Request, call_next):  # type: ignore[no-untyped-def]
     started = time.perf_counter()
     response = await call_next(request)
     if request.url.path != "/health" or response.status_code >= 400:
@@ -29,56 +30,82 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-@app.on_event("startup")
-def startup() -> None:
-    STORE_ROOT.mkdir(parents=True, exist_ok=True)
-    _log("startup", root=str(STORE_ROOT))
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/")
-def root() -> dict[str, object]:
-    return {"service": "storage-service", "objects": _list_objects()}
+async def root() -> dict[str, object]:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(objects_url(), headers=storage_headers())
+    _raise_platform_error(response)
+    return {
+        "service": "storage-service",
+        "bucket": BUCKET_NAME,
+        "objects": [item["key"] for item in response.json()],
+    }
 
 
 @app.put("/objects/{key}")
-def put_object(key: str, payload: ObjectPayload) -> dict[str, object]:
-    path = _safe_path(key)
-    path.write_text(payload.value, encoding="utf-8")
-    return {"key": key, "size": len(payload.value)}
+async def put_object(key: str, payload: ObjectPayload) -> dict[str, object]:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.put(
+            object_url(key),
+            content=payload.value.encode(),
+            headers=storage_headers("text/plain"),
+        )
+    _raise_platform_error(response)
+    return response.json()
 
 
 @app.get("/objects/{key}")
-def get_object(key: str) -> dict[str, object]:
-    path = _safe_path(key)
-    if not path.exists():
+async def get_object(key: str) -> dict[str, object]:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(object_url(key), headers=storage_headers())
+    if response.status_code == 404:
         raise HTTPException(status_code=404, detail="object not found")
-    value = path.read_text(encoding="utf-8")
+    _raise_platform_error(response)
+    value = response.content.decode(errors="replace")
     return {"key": key, "value": value, "size": len(value)}
 
 
 @app.delete("/objects/{key}")
-def delete_object(key: str) -> dict[str, object]:
-    path = _safe_path(key)
-    if path.exists():
-        path.unlink()
+async def delete_object(key: str) -> dict[str, object]:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.delete(object_url(key), headers=storage_headers())
+    if response.status_code not in {204, 404}:
+        _raise_platform_error(response)
     return {"key": key, "deleted": True}
 
 
-def _safe_path(key: str) -> Path:
+def objects_url() -> str:
+    return f"{storage_base_url()}/buckets/{BUCKET_NAME}/objects"
+
+
+def object_url(key: str) -> str:
     if "/" in key or "\\" in key or key in {"", ".", ".."}:
         raise HTTPException(status_code=400, detail="invalid key")
-    return STORE_ROOT / key
+    return f"{objects_url()}/{key}"
 
 
-def _list_objects() -> list[str]:
-    if not STORE_ROOT.exists():
-        return []
-    return sorted(item.name for item in STORE_ROOT.iterdir() if item.is_file())
+def storage_headers(content_type: str | None = None) -> dict[str, str]:
+    headers = {"X-AWS-Light-Service-Token": os.environ.get("AWS_LIGHT_SERVICE_TOKEN", "")}
+    if content_type is not None:
+        headers["content-type"] = content_type
+    return headers
+
+
+def storage_base_url() -> str:
+    return os.environ.get("AWS_LIGHT_STORAGE_URL", "http://proxy:8080/_aws-light/storage").rstrip(
+        "/"
+    )
+
+
+def _raise_platform_error(response: httpx.Response) -> None:
+    if response.status_code < 400:
+        return
+    raise HTTPException(status_code=response.status_code, detail=response.text)
 
 
 def _log(event: str, **fields: object) -> None:

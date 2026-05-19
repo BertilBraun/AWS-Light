@@ -18,6 +18,12 @@ spec:
   memoryRequestMb: 128
   port: 8000
   healthCheckPath: /health
-  env:
-    STORE_ROOT: /tmp/aws-light-storage-demo
+  env: {}
   secretRefs: []
+  resources:
+    buckets:
+      - name: demo-objects
+        access: [read, write]
+  ingress:
+    external: true
+    internal: false
