@@ -32,13 +32,8 @@ _HEALTHY_MARKER = Path("/app/healthy")
 async def main() -> None:
     log.configure("orchestrator")
 
-    # Create the managed-container Docker network synchronously before any
-    # async work. The proxy and health-checker containers join this network
-    # and must not start until it exists (see docker-compose.yml healthcheck).
     docker_client = DockerClient()
-    docker_client.ensure_network(settings.docker_network)
     _HEALTHY_MARKER.touch()
-    logger.info("Network %s ready", settings.docker_network)
 
     pool = await asyncpg.create_pool(settings.database_url, min_size=2, max_size=5)
     redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)

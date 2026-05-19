@@ -6,7 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     # ── Infrastructure ──────────────────────────────────────────────────────
     database_url: str = "postgresql://awslight:awslight@localhost:5432/awslight"
@@ -18,8 +20,6 @@ class Settings(BaseSettings):
     # ── API / network ────────────────────────────────────────────────────────
     api_port: int = 8000
     proxy_port: int = 8080
-    docker_network: str = "aws-light-data"
-
     # When true the proxy validates the JWT before forwarding.
     proxy_require_auth: bool = False
 
