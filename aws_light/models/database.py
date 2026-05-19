@@ -18,5 +18,8 @@ class DatabaseSpec(BaseModel):
 class DatabaseState(BaseModel):
     spec: DatabaseSpec
     status: ResourceStatus = ResourceStatus.PENDING
+    container_id: str = ""
+    container_name: str = ""
+    container_ip: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

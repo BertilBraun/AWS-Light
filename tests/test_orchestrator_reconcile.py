@@ -31,6 +31,9 @@ class FakeDockerClient:
         self.removed: list[str] = []
         self.stats: dict[str, ContainerStats] = {}
         self.created_envs: list[dict[str, str]] = []
+        self.created_images: list[str] = []
+        self.created_names: list[str] = []
+        self.created_labels: list[dict[str, str]] = []
 
     def container_is_running(self, container_id: str) -> bool:
         return container_id in self.running_containers
@@ -55,6 +58,9 @@ class FakeDockerClient:
     ) -> tuple[str, str]:
         self.created += 1
         self.created_envs.append(env)
+        self.created_images.append(image)
+        self.created_names.append(name)
+        self.created_labels.append(labels)
         container_id = f"new-container-{self.created}"
         self.running_containers.add(container_id)
         return container_id, f"10.0.1.{self.created}"
@@ -378,6 +384,99 @@ async def test_create_replica_injects_bound_database_env(tmp_path: Path) -> None
     assert created_env["AWS_LIGHT_DATABASE_APP_DB_URL"].endswith(
         "@aws-light-db-app-db:5432/app_db"
     )
+
+
+async def test_reconcile_all_provisions_pending_database_container(tmp_path: Path) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    database_store: JsonStore[DatabaseState] = JsonStore(tmp_path / "databases.json", DatabaseState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    secrets_manager = FakeSecretsManager()
+    database = DatabaseState(
+        spec=DatabaseSpec(
+            name="app-db",
+            engine="postgres",
+            version="16",
+            storage_mb=512,
+        )
+    )
+    await database_store.put("app-db", database)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        database_store=database_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=secrets_manager,  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    updated = await database_store.get("app-db")
+    assert updated is not None
+    assert updated.status == ResourceStatus.RUNNING
+    assert updated.container_id == "new-container-1"
+    assert updated.container_name == "aws-light-db-app-db"
+    assert docker_client.created_images == ["postgres:16"]
+    assert docker_client.created_names == ["aws-light-db-app-db"]
+    assert docker_client.created_envs[0]["POSTGRES_DB"] == "app_db"
+    assert docker_client.created_envs[0]["POSTGRES_USER"] == "app_db_user"
+    assert docker_client.created_envs[0]["POSTGRES_PASSWORD"]
+    assert (
+        docker_client.created_envs[0]["POSTGRES_PASSWORD"]
+        == secrets_manager.created_secrets["aws-light-database-app-db-password"]
+    )
+    assert docker_client.created_labels[0]["aws-light.database"] == "app-db"
+
+
+async def test_reconcile_all_marks_missing_database_container_pending(
+    tmp_path: Path,
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    database_store: JsonStore[DatabaseState] = JsonStore(tmp_path / "databases.json", DatabaseState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    database = DatabaseState(
+        spec=DatabaseSpec(name="app-db"),
+        status=ResourceStatus.RUNNING,
+        container_id="missing-container",
+        container_name="aws-light-db-app-db",
+    )
+    await database_store.put("app-db", database)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        database_store=database_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    updated = await database_store.get("app-db")
+    assert updated is not None
+    assert updated.status == ResourceStatus.PENDING
+    assert updated.container_id == ""
+    assert updated.container_name == ""
 
 
 async def test_collect_cpu_stats_updates_actual_node_usage(tmp_path: Path) -> None:

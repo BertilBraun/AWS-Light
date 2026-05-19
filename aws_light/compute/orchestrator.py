@@ -27,6 +27,7 @@ _DOCKER_LABEL_MANAGED = "aws-light.managed"
 _DOCKER_LABEL_SERVICE = "aws-light.service"
 _DOCKER_LABEL_REPLICA = "aws-light.replica-id"
 _DOCKER_LABEL_NODE = "aws-light.node"
+_DOCKER_LABEL_DATABASE = "aws-light.database"
 
 _ROLLOUT_HEALTH_WAIT_INTERVAL = 2
 _ROLLOUT_HEALTH_WAIT_TIMEOUT = 60
@@ -111,6 +112,9 @@ class ComputeOrchestrator:
             await asyncio.sleep(settings.reconcile_interval_seconds)
 
     async def _reconcile_all(self) -> None:
+        if self._database_store is not None:
+            for database_state in await self._database_store.list():
+                await self._reconcile_database(database_state)
         all_services = await self._service_store.list()
         for service_state in all_services:
             if service_state.status == ResourceStatus.DELETING:
@@ -119,6 +123,71 @@ class ComputeOrchestrator:
                 await self._reconcile_service(service_state)
         if self._node_store is not None:
             await self._sync_nodes_to_store()
+
+    async def _reconcile_database(self, database_state: DatabaseState) -> None:
+        if database_state.status == ResourceStatus.DELETING:
+            await self._teardown_database(database_state)
+            return
+
+        if database_state.container_id:
+            if self._docker_client.container_is_running(database_state.container_id):
+                if database_state.status != ResourceStatus.RUNNING:
+                    database_state.status = ResourceStatus.RUNNING
+                    database_state.updated_at = datetime.utcnow()
+                    await self._database_store.put(  # type: ignore[union-attr]
+                        database_state.spec.name, database_state
+                    )
+                return
+            database_state.status = ResourceStatus.PENDING
+            database_state.container_id = ""
+            database_state.container_name = ""
+            database_state.container_ip = ""
+            database_state.updated_at = datetime.utcnow()
+            await self._database_store.put(database_state.spec.name, database_state)  # type: ignore[union-attr]
+            return
+
+        await self._create_database_container(database_state)
+
+    async def _create_database_container(self, database_state: DatabaseState) -> None:
+        spec = database_state.spec
+        container_name = f"aws-light-db-{spec.name}"
+        db_name = _database_identifier(spec.name)
+        db_user = f"{db_name}_user"
+        db_password = await self._database_password(spec.name)
+        labels = {
+            _DOCKER_LABEL_MANAGED: "true",
+            _DOCKER_LABEL_DATABASE: spec.name,
+        }
+        try:
+            container_id, container_ip = self._docker_client.create_container(
+                image=f"postgres:{spec.version}",
+                name=container_name,
+                env={
+                    "POSTGRES_DB": db_name,
+                    "POSTGRES_USER": db_user,
+                    "POSTGRES_PASSWORD": db_password,
+                },
+                cpu_quota=0.25,
+                memory_mb=256,
+                network=settings.docker_network,
+                labels=labels,
+                container_port=5432,
+            )
+        except Exception:
+            logger.exception("Failed to create database container for %s", spec.name)
+            return
+
+        database_state.status = ResourceStatus.RUNNING
+        database_state.container_id = container_id
+        database_state.container_name = container_name
+        database_state.container_ip = container_ip
+        database_state.updated_at = datetime.utcnow()
+        await self._database_store.put(spec.name, database_state)  # type: ignore[union-attr]
+
+    async def _teardown_database(self, database_state: DatabaseState) -> None:
+        if database_state.container_id:
+            self._docker_client.remove_container(database_state.container_id)
+        await self._database_store.delete(database_state.spec.name)  # type: ignore[union-attr]
 
     async def _sync_nodes_to_store(self) -> None:
         for node_state in self._node_manager.get_all_nodes():
