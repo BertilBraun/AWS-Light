@@ -64,6 +64,10 @@ def _service_network_name(service_name: str) -> str:
     return f"aws-light-svc-{service_name}"
 
 
+def _database_network_name(database_name: str) -> str:
+    return f"aws-light-db-{database_name}"
+
+
 class ComputeOrchestrator:
     def __init__(
         self,
@@ -163,6 +167,8 @@ class ComputeOrchestrator:
             _DOCKER_LABEL_MANAGED: "true",
             _DOCKER_LABEL_DATABASE: spec.name,
         }
+        database_network = _database_network_name(spec.name)
+        self._docker_client.ensure_network(database_network)
         try:
             container_id, container_ip = self._docker_client.create_container(
                 image=f"postgres:{spec.version}",
@@ -174,7 +180,7 @@ class ComputeOrchestrator:
                 },
                 cpu_quota=0.25,
                 memory_mb=256,
-                network=settings.docker_network,
+                network=database_network,
                 labels=labels,
                 container_port=5432,
             )

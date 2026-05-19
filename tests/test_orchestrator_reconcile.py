@@ -542,6 +542,8 @@ async def test_reconcile_all_provisions_pending_database_container(tmp_path: Pat
     assert updated.container_name == "aws-light-db-app-db"
     assert docker_client.created_images == ["postgres:16"]
     assert docker_client.created_names == ["aws-light-db-app-db"]
+    assert "aws-light-db-app-db" in docker_client.ensured_networks
+    assert docker_client.created_networks == ["aws-light-db-app-db"]
     assert docker_client.created_envs[0]["POSTGRES_DB"] == "app_db"
     assert docker_client.created_envs[0]["POSTGRES_USER"] == "app_db_user"
     assert docker_client.created_envs[0]["POSTGRES_PASSWORD"]
