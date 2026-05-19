@@ -1,0 +1,35 @@
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: internal-backend
+spec:
+  image: aws-light/internal-backend:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 2
+  cpuRequest: 0.1
+  memoryRequestMb: 96
+  port: 8000
+  healthCheckPath: /health
+  ingress:
+    external: false
+    internal:
+      allowFrom:
+        - internal-frontend
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: internal-frontend
+spec:
+  image: aws-light/internal-frontend:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 2
+  cpuRequest: 0.1
+  memoryRequestMb: 96
+  port: 8000
+  healthCheckPath: /health
+  ingress:
+    external: true
+    internal: false
