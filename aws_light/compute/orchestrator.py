@@ -68,6 +68,10 @@ def _database_network_name(database_name: str) -> str:
     return f"aws-light-db-{database_name}"
 
 
+def _database_volume_name(database_name: str) -> str:
+    return f"aws-light-db-{database_name}-data"
+
+
 class ComputeOrchestrator:
     def __init__(
         self,
@@ -182,6 +186,9 @@ class ComputeOrchestrator:
                 network=database_network,
                 labels=labels,
                 container_port=5432,
+                volumes={
+                    _database_volume_name(spec.name): "/var/lib/postgresql/data",
+                },
             )
         except Exception:
             logger.exception("Failed to create database container for %s", spec.name)
@@ -198,6 +205,7 @@ class ComputeOrchestrator:
     async def _teardown_database(self, database_state: DatabaseState) -> None:
         if database_state.container_id:
             self._docker_client.remove_container(database_state.container_id)
+        self._docker_client.remove_network(_database_network_name(database_state.spec.name))
         await self._database_store.delete(database_state.spec.name)  # type: ignore[union-attr]
 
     async def _sync_nodes_to_store(self) -> None:
@@ -219,6 +227,7 @@ class ComputeOrchestrator:
             await self._remove_replica(service_state, replica)
         await self._service_store.delete(service_state.spec.name)
         await self._routing_table.remove_service(service_state.spec.name)
+        self._docker_client.remove_network(_service_network_name(service_state.spec.name))
         logger.info("Tore down deleted service %s", service_state.spec.name)
 
     async def _reconcile_service(self, service_state: ServiceState) -> None:
@@ -808,4 +817,5 @@ class ComputeOrchestrator:
             )
         await self._service_store.delete(service_name)
         await self._routing_table.remove_service(service_name)
+        self._docker_client.remove_network(_service_network_name(service_name))
         logger.info("Deleted service %s", service_name)

@@ -63,6 +63,15 @@ class DockerClient:
                 network_name,
             )
 
+    def remove_network(self, network_name: str) -> None:
+        try:
+            network = self._client.networks.get(network_name)
+            network.remove()
+        except docker.errors.NotFound:
+            pass
+        except docker.errors.APIError as error:
+            logger.warning("Could not remove network %s: %s", network_name, error)
+
     def pull_image(self, image: str) -> None:
         self._client.images.pull(image)
 
@@ -76,6 +85,7 @@ class DockerClient:
         network: str,
         labels: dict[str, str],
         container_port: int,
+        volumes: dict[str, str] | None = None,
     ) -> tuple[str, str]:
         """Create a container and return (container_id, container_ip)."""
         cpu_quota_microseconds = int(cpu_quota * 100000)
@@ -88,6 +98,7 @@ class DockerClient:
             mem_limit=f"{memory_mb}m",
             network=network,
             labels=labels,
+            volumes=volumes,
             remove=False,
         )
         container_ip = self._poll_container_ip(container, network)

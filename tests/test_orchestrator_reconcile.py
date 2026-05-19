@@ -35,14 +35,19 @@ class FakeDockerClient:
         self.created_names: list[str] = []
         self.created_labels: list[dict[str, str]] = []
         self.created_networks: list[str] = []
+        self.created_volumes: list[dict[str, str]] = []
         self.ip_network_requests: list[tuple[str, str]] = []
         self.container_ips: dict[tuple[str, str], str] = {}
         self.ensured_networks: list[str] = []
+        self.removed_networks: list[str] = []
         self.network_connections: list[tuple[str, str]] = []
         self.compose_containers: list[ComposeContainerInfo] = []
 
     def ensure_network(self, network_name: str) -> None:
         self.ensured_networks.append(network_name)
+
+    def remove_network(self, network_name: str) -> None:
+        self.removed_networks.append(network_name)
 
     def connect_container_to_network(self, container_id: str, network_name: str) -> None:
         self.network_connections.append((container_id, network_name))
@@ -70,6 +75,7 @@ class FakeDockerClient:
         network: str,
         labels: dict[str, str],
         container_port: int,
+        volumes: dict[str, str] | None = None,
     ) -> tuple[str, str]:
         self.created += 1
         self.created_envs.append(env)
@@ -77,6 +83,7 @@ class FakeDockerClient:
         self.created_names.append(name)
         self.created_labels.append(labels)
         self.created_networks.append(network)
+        self.created_volumes.append(volumes or {})
         container_id = f"new-container-{self.created}"
         self.running_containers.add(container_id)
         return container_id, f"10.0.1.{self.created}"
@@ -642,6 +649,9 @@ async def test_reconcile_all_provisions_pending_database_container(tmp_path: Pat
     assert docker_client.created_names == ["aws-light-db-app-db"]
     assert "aws-light-db-app-db" in docker_client.ensured_networks
     assert docker_client.created_networks == ["aws-light-db-app-db"]
+    assert docker_client.created_volumes == [
+        {"aws-light-db-app-db-data": "/var/lib/postgresql/data"}
+    ]
     assert docker_client.created_envs[0]["POSTGRES_DB"] == "app_db"
     assert docker_client.created_envs[0]["POSTGRES_USER"] == "app_db_user"
     assert docker_client.created_envs[0]["POSTGRES_PASSWORD"]
@@ -691,6 +701,45 @@ async def test_reconcile_all_marks_missing_database_container_pending(
     assert updated.status == ResourceStatus.PENDING
     assert updated.container_id == ""
     assert updated.container_name == ""
+
+
+async def test_teardown_database_removes_container_and_network_but_keeps_volume(
+    tmp_path: Path,
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    database_store: JsonStore[DatabaseState] = JsonStore(tmp_path / "databases.json", DatabaseState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers={"database-container"})
+    database = DatabaseState(
+        spec=DatabaseSpec(name="app-db"),
+        status=ResourceStatus.DELETING,
+        container_id="database-container",
+        container_name="aws-light-db-app-db",
+    )
+    await database_store.put("app-db", database)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        database_store=database_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    assert "database-container" in docker_client.removed
+    assert "aws-light-db-app-db" in docker_client.removed_networks
+    assert await database_store.get("app-db") is None
 
 
 async def test_bound_service_and_database_join_service_network(tmp_path: Path) -> None:
@@ -809,6 +858,57 @@ async def test_proxy_and_health_checker_join_service_network(tmp_path: Path) -> 
     assert ("proxy-container", "aws-light-svc-api") in docker_client.network_connections
     assert ("health-container", "aws-light-svc-api") in docker_client.network_connections
     assert ("autoscaler-container", "aws-light-svc-api") not in docker_client.network_connections
+
+
+async def test_teardown_service_removes_service_network(tmp_path: Path) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers={"container-1"})
+    service = ServiceState(
+        spec=ServiceSpec(
+            name="api",
+            image="example/api:latest",
+            replicas=1,
+            cpu_request=0.2,
+            memory_request_mb=128,
+            port=8000,
+        ),
+        status=ResourceStatus.DELETING,
+        replicas=[
+            ReplicaState(
+                replica_id="replica-1",
+                container_id="container-1",
+                node_id="node-00",
+                status=ResourceStatus.RUNNING,
+                container_ip="172.25.0.4",
+                image="example/api:latest",
+                started_at=datetime.utcnow(),
+            )
+        ],
+    )
+    await service_store.put("api", service)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    assert "container-1" in docker_client.removed
+    assert "aws-light-svc-api" in docker_client.removed_networks
+    assert await service_store.get("api") is None
 
 
 async def test_collect_cpu_stats_updates_actual_node_usage(tmp_path: Path) -> None:
