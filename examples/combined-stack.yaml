@@ -1,0 +1,87 @@
+apiVersion: aws-light/v1
+kind: Secrets
+secrets:
+  combined-api-token: demo-token
+---
+apiVersion: aws-light/v1
+kind: Bucket
+metadata:
+  name: combined-objects
+spec:
+  versioning: false
+---
+apiVersion: aws-light/v1
+kind: Database
+metadata:
+  name: combined-db
+spec:
+  engine: postgres
+  version: "16"
+  storageMb: 512
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: cpu-service
+spec:
+  image: aws-light/cpu-service:latest
+  replicas: 3
+  minReplicas: 2
+  maxReplicas: 6
+  cpuRequest: 0.2
+  memoryRequestMb: 128
+  port: 8000
+  healthCheckPath: /health
+  ingress:
+    external: false
+    internal:
+      allowFrom:
+        - combined-service
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: flaky-service
+spec:
+  image: aws-light/flaky-service:latest
+  replicas: 2
+  minReplicas: 1
+  maxReplicas: 4
+  cpuRequest: 0.1
+  memoryRequestMb: 96
+  port: 8000
+  healthCheckPath: /health
+  env:
+    REQUEST_FAILURE_RATE: "0.35"
+    HEALTH_FAILURE_RATE: "0.15"
+  ingress:
+    external: false
+    internal:
+      allowFrom:
+        - combined-service
+---
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: combined-service
+spec:
+  image: aws-light/combined-service:latest
+  replicas: 1
+  minReplicas: 1
+  maxReplicas: 3
+  cpuRequest: 0.2
+  memoryRequestMb: 160
+  port: 8000
+  healthCheckPath: /health
+  secretRefs:
+    - combined-api-token
+  resources:
+    buckets:
+      - name: combined-objects
+        access: [read, write]
+    databases:
+      - name: combined-db
+        access: [connect]
+  ingress:
+    external: true
+    internal: false
