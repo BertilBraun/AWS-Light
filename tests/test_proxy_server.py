@@ -100,6 +100,14 @@ class FakeWriter:
         return None
 
 
+class FakeUpstreamWriter(FakeWriter):
+    def close(self) -> None:
+        return None
+
+    async def wait_closed(self) -> None:
+        return None
+
+
 def _reader_with(data: bytes) -> asyncio.StreamReader:
     reader = asyncio.StreamReader()
     reader.feed_data(data)
@@ -229,6 +237,48 @@ async def test_proxy_denies_external_request_when_service_not_exposed() -> None:
     )
 
     assert writer.data == _403_RESPONSE
+    assert balancer.requested_services == []
+
+
+async def test_proxy_forwards_platform_storage_path_before_ingress_policy(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    service_store = FakeServiceStore({"proxy:8080": _service_state("proxy:8080")})
+    balancer = FakeBalancer()
+    proxy = ProxyServer(
+        balancer=balancer,  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+        secrets_manager=FakeSecretsManager(
+            {"aws-light-service-token-combined-service": "combined-token"}
+        ),  # type: ignore[arg-type]
+    )
+    writer = FakeWriter()
+    upstream_reader = _reader_with(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+    )
+    upstream_writer = FakeUpstreamWriter()
+    upstream_connections: list[tuple[str, int]] = []
+
+    async def fake_open_connection(host: str, port: int):  # type: ignore[no-untyped-def]
+        upstream_connections.append((host, port))
+        return upstream_reader, upstream_writer
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+
+    await proxy._proxy_request(
+        _reader_with(
+            b"GET /_aws-light/storage/buckets/combined-objects/objects HTTP/1.1\r\n"
+            b"Host: proxy:8080\r\n"
+            b"X-AWS-Light-Service-Token: combined-token\r\n"
+            b"\r\n"
+        ),
+        writer,  # type: ignore[arg-type]
+    )
+
+    assert upstream_connections == [("control-plane", 8000)]
+    assert b"HTTP/1.1 200 OK" in writer.data
+    assert b"Host: control-plane:8000\r\n" in upstream_writer.data
     assert balancer.requested_services == []
 
 

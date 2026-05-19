@@ -83,6 +83,9 @@ _PROXY_TIMESERIES_BUCKET_SECONDS = 10
 _PROXY_ACTIVITY_INTERVAL_SECONDS = 10.0
 _SERVICE_TOKEN_HEADER = b"x-aws-light-service-token"
 _SERVICE_TOKEN_SECRET_PREFIX = "aws-light-service-token-"
+_PLATFORM_STORAGE_PREFIX = "/_aws-light/storage"
+_CONTROL_PLANE_HOST = "control-plane"
+_CONTROL_PLANE_PORT = 8000
 
 
 class ProxyServer:
@@ -167,6 +170,17 @@ class ProxyServer:
                 await writer.drain()
                 await self._record_proxy_result(None, 400, "incomplete_request_body", 0.0)
                 return
+
+        if _extract_request_path(header_bytes).startswith(_PLATFORM_STORAGE_PREFIX):
+            await self._forward_to_upstream(
+                header_bytes,
+                body,
+                writer,
+                _CONTROL_PLANE_HOST,
+                _CONTROL_PLANE_PORT,
+                "__platform_storage__",
+            )
+            return
 
         service_name = _extract_service_name(header_bytes)
         if service_name is None:
@@ -291,6 +305,72 @@ class ProxyServer:
             await upstream_writer.wait_closed()
             duration_ms = (time.perf_counter() - started) * 1000
             await self._record_proxy_result(service_name, status_code, None, duration_ms)
+
+    async def _forward_to_upstream(
+        self,
+        header_bytes: bytes,
+        body: bytes,
+        writer: asyncio.StreamWriter,
+        upstream_host: str,
+        upstream_port: int,
+        metric_service: str,
+    ) -> None:
+        started = time.perf_counter()
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(upstream_host, upstream_port), timeout=5.0
+            )
+        except (OSError, asyncio.TimeoutError) as error:
+            writer.write(_502_RESPONSE)
+            await writer.drain()
+            duration_ms = (time.perf_counter() - started) * 1000
+            logger.warning(
+                "Proxy could not connect to platform upstream %s:%d: %s",
+                upstream_host,
+                upstream_port,
+                error,
+            )
+            await self._record_proxy_result(
+                metric_service, 502, "upstream_unreachable", duration_ms
+            )
+            return
+
+        rewritten_headers = _rewrite_request_headers(header_bytes, upstream_host, upstream_port)
+        upstream_writer.write(rewritten_headers)
+        if body:
+            upstream_writer.write(body)
+        await upstream_writer.drain()
+
+        try:
+            upstream_response = await _read_full_response(upstream_reader)
+        except UpstreamResponseTimeout:
+            writer.write(_504_RESPONSE)
+            await writer.drain()
+            upstream_writer.close()
+            await upstream_writer.wait_closed()
+            duration_ms = (time.perf_counter() - started) * 1000
+            await self._record_proxy_result(
+                metric_service, 504, "upstream_response_timeout", duration_ms
+            )
+            return
+        except UpstreamResponseError:
+            writer.write(_502_RESPONSE)
+            await writer.drain()
+            upstream_writer.close()
+            await upstream_writer.wait_closed()
+            duration_ms = (time.perf_counter() - started) * 1000
+            await self._record_proxy_result(
+                metric_service, 502, "upstream_invalid_response", duration_ms
+            )
+            return
+
+        status_code = _extract_response_status(upstream_response) or 502
+        writer.write(upstream_response)
+        await writer.drain()
+        upstream_writer.close()
+        await upstream_writer.wait_closed()
+        duration_ms = (time.perf_counter() - started) * 1000
+        await self._record_proxy_result(metric_service, status_code, None, duration_ms)
 
     async def _external_ingress_allowed(self, service_name: str) -> bool:
         if self._service_store is None:
@@ -453,6 +533,14 @@ def _extract_service_name(header_bytes: bytes) -> str | None:
                 return hostname[: -len(".localhost")]
             return hostname
     return None
+
+
+def _extract_request_path(header_bytes: bytes) -> str:
+    request_line = header_bytes.split(b"\r\n", 1)[0]
+    parts = request_line.split()
+    if len(parts) < 2:
+        return ""
+    return parts[1].decode(errors="replace")
 
 
 def _is_websocket_upgrade(header_bytes: bytes) -> bool:
