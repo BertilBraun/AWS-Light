@@ -30,6 +30,7 @@ from aws_light.iac.applier import Applier
 from aws_light.iac.differ import Differ
 from aws_light.iam.auth import make_default_admin
 from aws_light.models.deployment import RolloutState
+from aws_light.models.database import DatabaseState
 from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.iam import UserSpec
 from aws_light.models.node import NodeState
@@ -53,12 +54,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     event_bus = RedisEventBus(redis_client)
 
     service_store: PostgresStore[ServiceState] = PostgresStore(pool, "services", ServiceState)
+    database_store: PostgresStore[DatabaseState] = PostgresStore(pool, "databases", DatabaseState)
     deployment_store: PostgresStore[RolloutState] = PostgresStore(pool, "deployments", RolloutState)
     node_store: PostgresStore[NodeState] = PostgresStore(pool, "nodes", NodeState)
     secret_pg_store: PostgresStore[SecretSpec] = PostgresStore(pool, "secrets", SecretSpec)
     user_store: PostgresStore[UserSpec] = PostgresStore(pool, "users", UserSpec)
 
-    for store in [service_store, deployment_store, node_store, secret_pg_store, user_store]:
+    for store in [
+        service_store,
+        database_store,
+        deployment_store,
+        node_store,
+        secret_pg_store,
+        user_store,
+    ]:
         await store.create_table()
 
     secrets_manager = SecretsManager(secret_store=secret_pg_store)
@@ -69,6 +78,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     applier = Applier(
         service_store=service_store,
+        database_store=database_store,
         secrets_manager=secrets_manager,
         storage_service=storage_service,
         differ=Differ(),
@@ -77,6 +87,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Register into the shared dependency registry used by all API routes.
     deps._service_store = service_store
+    deps._database_store = database_store
     deps._deployment_store = deployment_store
     deps._node_store = node_store
     deps._user_store = user_store

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from aws_light.dependencies import get_node_store, get_routing_table, get_service_store
+from aws_light.dependencies import (
+    get_database_store,
+    get_node_store,
+    get_routing_table,
+    get_service_store,
+    get_storage_service,
+)
 from aws_light.iam.middleware import get_current_user
 from aws_light.models.iam import UserSpec
 
@@ -12,6 +18,8 @@ router = APIRouter(prefix="/api/v1/platform/topology", tags=["platform"])
 @router.get("")
 async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, object]:
     services = await get_service_store().list()
+    databases = await get_database_store().list()
+    buckets = get_storage_service().list_buckets()
     nodes = await get_node_store().list()
     routing_table = get_routing_table()
     routed_endpoints_by_service = {
@@ -64,6 +72,23 @@ async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, obj
             )
         )
 
+    for bucket in buckets:
+        graph_nodes.append(_node(f"bucket:{bucket.name}", bucket.name, "bucket"))
+
+    for database in databases:
+        graph_nodes.append(
+            _node(
+                f"database:{database.spec.name}",
+                database.spec.name,
+                "database",
+                {
+                    "engine": database.spec.engine,
+                    "version": database.spec.version,
+                    "status": database.status.value,
+                },
+            )
+        )
+
     for service in services:
         service_id = f"service:{service.spec.name}"
         graph_nodes.append(
@@ -75,12 +100,41 @@ async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, obj
                     "desired_replicas": service.spec.replicas,
                     "actual_replicas": len(service.replicas),
                     "status": service.status.value,
+                    "ingress_external": service.spec.ingress.external,
+                    "ingress_internal": service.spec.ingress.internal.enabled,
+                    "ingress_internal_allow_from": service.spec.ingress.internal.allow_from,
                 },
             )
         )
         graph_edges.append(_edge("proxy", service_id, "routes requests"))
         graph_edges.append(_edge("health-checker", service_id, "checks health"))
         graph_edges.append(_edge("autoscaler", service_id, "adjusts desired replicas"))
+        for bucket_binding in service.spec.resources.buckets:
+            graph_edges.append(
+                _edge(
+                    service_id,
+                    f"bucket:{bucket_binding.name}",
+                    "binds bucket",
+                    {"access": bucket_binding.access},
+                )
+            )
+        for database_binding in service.spec.resources.databases:
+            graph_edges.append(
+                _edge(
+                    service_id,
+                    f"database:{database_binding.name}",
+                    "binds database",
+                    {"access": database_binding.access},
+                )
+            )
+        for source_service in service.spec.ingress.internal.allow_from:
+            graph_edges.append(
+                _edge(
+                    f"service:{source_service}",
+                    service_id,
+                    "allowed internal ingress",
+                )
+            )
         routed_by_replica = {
             endpoint.replica_id: endpoint
             for endpoint in routed_endpoints_by_service.get(service.spec.name, [])

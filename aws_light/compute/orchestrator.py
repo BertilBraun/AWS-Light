@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import uuid
 from datetime import datetime
 
@@ -28,6 +29,8 @@ _DOCKER_LABEL_NODE = "aws-light.node"
 
 _ROLLOUT_HEALTH_WAIT_INTERVAL = 2
 _ROLLOUT_HEALTH_WAIT_TIMEOUT = 60
+_PROXY_WORKLOAD_URL = "http://proxy:8080"
+_SERVICE_TOKEN_SECRET_PREFIX = "aws-light-service-token-"
 
 
 def _node_capacity_payload(node: NodeState) -> dict[str, object]:
@@ -378,7 +381,8 @@ class ComputeOrchestrator:
         }
 
         secret_env = await self._secrets_manager.inject_into_env(spec.secret_refs)
-        merged_env = {**spec.env, **secret_env}
+        platform_env = await self._platform_env(spec.name)
+        merged_env = {**spec.env, **secret_env, **platform_env}
 
         try:
             container_id, container_ip = self._docker_client.create_container(
@@ -476,6 +480,25 @@ class ComputeOrchestrator:
             if replica.status == ResourceStatus.RUNNING and replica.container_ip
         ]
         await self._routing_table.update_service(service_state.spec.name, endpoints)
+
+    async def _platform_env(self, service_name: str) -> dict[str, str]:
+        token = await self._service_token(service_name)
+        return {
+            "AWS_LIGHT_SERVICE_NAME": service_name,
+            "AWS_LIGHT_SERVICE_TOKEN": token,
+            "AWS_LIGHT_PROXY_URL": _PROXY_WORKLOAD_URL,
+            "AWS_LIGHT_STORAGE_URL": f"{_PROXY_WORKLOAD_URL}/_aws-light/storage",
+        }
+
+    async def _service_token(self, service_name: str) -> str:
+        secret_name = f"{_SERVICE_TOKEN_SECRET_PREFIX}{service_name}"
+        existing = await self._secrets_manager.get_secret(secret_name)
+        if existing:
+            return existing
+
+        token = secrets.token_urlsafe(32)
+        await self._secrets_manager.create_secret(secret_name, token)
+        return token
 
     async def _remove_orphan_containers(self) -> None:
         known_container_ids: set[str] = set()

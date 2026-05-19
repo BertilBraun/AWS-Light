@@ -6,9 +6,19 @@ from fastapi.testclient import TestClient
 
 import aws_light.dependencies as deps
 from aws_light.models.common import ResourceStatus
+from aws_light.models.database import DatabaseSpec, DatabaseState
 from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.node import NodeSpec, NodeState, ResourceUsage
-from aws_light.models.service import ReplicaState, ServiceSpec, ServiceState
+from aws_light.models.service import (
+    BucketBinding,
+    DatabaseBinding,
+    InternalIngressPolicy,
+    ReplicaState,
+    ServiceIngressSpec,
+    ServiceResourceBindings,
+    ServiceSpec,
+    ServiceState,
+)
 from aws_light.proxy.routing_table import ReplicaEndpoint
 
 
@@ -134,6 +144,61 @@ def test_topology_returns_platform_service_replica_and_node_graph(
     assert ("replica:replica-1", "node:node-00") in edge_pairs
     assert ("redis-routing", "replica:replica-1") in edge_pairs
     assert ("proxy", "replica:replica-1") in edge_pairs
+
+
+async def _seed_resource_policy_topology_state() -> None:
+    deps.get_storage_service().create_bucket("demo-objects")
+    await deps.get_database_store().put(
+        "app-db",
+        DatabaseState(spec=DatabaseSpec(name="app-db", engine="postgres", version="16")),
+    )
+    await deps.get_service_store().put(
+        "api",
+        ServiceState(
+            spec=ServiceSpec(
+                name="api",
+                image="api:latest",
+                resources=ServiceResourceBindings(
+                    buckets=[BucketBinding(name="demo-objects", access=["read", "write"])],
+                    databases=[DatabaseBinding(name="app-db", access=["connect"])],
+                ),
+                ingress=ServiceIngressSpec(external=True, internal=InternalIngressPolicy()),
+            ),
+            status=ResourceStatus.PENDING,
+        ),
+    )
+    await deps.get_service_store().put(
+        "frontend",
+        ServiceState(
+            spec=ServiceSpec(
+                name="frontend",
+                image="frontend:latest",
+                ingress=ServiceIngressSpec(
+                    external=True,
+                    internal=InternalIngressPolicy(enabled=True, allow_from=["api"]),
+                ),
+            ),
+            status=ResourceStatus.PENDING,
+        ),
+    )
+
+
+def test_topology_includes_resource_bindings_and_ingress_policy(
+    client: TestClient,
+) -> None:
+    client.portal.call(_seed_resource_policy_topology_state)
+    response = client.get("/api/v1/platform/topology", headers=_auth_headers(client))
+
+    assert response.status_code == 200
+    payload = response.json()
+    node_ids = {node["id"] for node in payload["nodes"]}
+    edge_pairs = {(edge["source"], edge["target"], edge["label"]) for edge in payload["edges"]}
+
+    assert "bucket:demo-objects" in node_ids
+    assert "database:app-db" in node_ids
+    assert ("service:api", "bucket:demo-objects", "binds bucket") in edge_pairs
+    assert ("service:api", "database:app-db", "binds database") in edge_pairs
+    assert ("service:api", "service:frontend", "allowed internal ingress") in edge_pairs
 
 
 def test_introspection_requires_auth(client: TestClient) -> None:

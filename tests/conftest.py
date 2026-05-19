@@ -12,8 +12,11 @@ from fastapi.testclient import TestClient
 import aws_light.config as config_module
 import aws_light.dependencies as deps
 from aws_light.dashboard.event_bus import EventBus
+from aws_light.iac.applier import Applier
+from aws_light.iac.differ import Differ
 from aws_light.iam.auth import make_default_admin
 from aws_light.models.deployment import RolloutState
+from aws_light.models.database import DatabaseState
 from aws_light.models.iam import UserSpec
 from aws_light.models.node import NodeState
 from aws_light.models.secret import SecretSpec
@@ -63,6 +66,7 @@ async def _minimal_lifespan(app: FastAPI) -> AsyncIterator[None]:
     secret_store: JsonStore[SecretSpec] = JsonStore(data_dir / "secrets.json", SecretSpec)
     deps._user_store = user_store
     deps._service_store = JsonStore(data_dir / "services.json", ServiceState)
+    deps._database_store = JsonStore(data_dir / "databases.json", DatabaseState)
     deps._deployment_store = JsonStore(data_dir / "deployments.json", RolloutState)
     deps._node_store = JsonStore(data_dir / "nodes.json", NodeState)
     deps._secrets_manager = SecretsManager(secret_store)
@@ -73,6 +77,14 @@ async def _minimal_lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     deps._event_bus = EventBus()
     deps._redis_client = FakeRedis()
+    deps._applier = Applier(
+        service_store=deps._service_store,
+        database_store=deps._database_store,
+        secrets_manager=deps._secrets_manager,
+        storage_service=deps._storage_service,
+        differ=Differ(),
+        event_bus=deps._event_bus,
+    )
     admin_username = config_module.settings.default_admin_username
     if not await user_store.exists(admin_username):
         admin = make_default_admin()
@@ -84,6 +96,7 @@ async def _minimal_lifespan(app: FastAPI) -> AsyncIterator[None]:
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setattr(config_module, "settings", config_module.Settings(data_directory=tmp_path))
     monkeypatch.setattr(deps, "_user_store", None)
+    monkeypatch.setattr(deps, "_database_store", None)
 
     app = create_app(lifespan_override=_minimal_lifespan)
     with TestClient(app) as test_client:

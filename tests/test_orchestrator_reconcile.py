@@ -23,6 +23,7 @@ class FakeDockerClient:
         self.created = 0
         self.removed: list[str] = []
         self.stats: dict[str, ContainerStats] = {}
+        self.created_envs: list[dict[str, str]] = []
 
     def container_is_running(self, container_id: str) -> bool:
         return container_id in self.running_containers
@@ -46,6 +47,7 @@ class FakeDockerClient:
         container_port: int,
     ) -> tuple[str, str]:
         self.created += 1
+        self.created_envs.append(env)
         container_id = f"new-container-{self.created}"
         self.running_containers.add(container_id)
         return container_id, f"10.0.1.{self.created}"
@@ -63,8 +65,17 @@ class FakeEventBus:
 
 
 class FakeSecretsManager:
+    def __init__(self) -> None:
+        self.created_secrets: dict[str, str] = {}
+
     async def inject_into_env(self, secret_refs: list[str]) -> dict[str, str]:
         return {}
+
+    async def get_secret(self, name: str) -> str | None:
+        return self.created_secrets.get(name)
+
+    async def create_secret(self, name: str, value: str) -> None:
+        self.created_secrets[name] = value
 
 
 class FakeRedis:
@@ -199,6 +210,102 @@ async def test_reconcile_emits_no_capacity_when_replica_cannot_fit(tmp_path: Pat
     assert len(no_capacity_events) == 1
     assert no_capacity_events[0].payload["service_name"] == "too-large"
     assert no_capacity_events[0].payload["cpu_request"] == 2.0
+
+
+async def test_create_replica_injects_platform_identity_env(tmp_path: Path) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    secrets_manager = FakeSecretsManager()
+
+    service = ServiceState(
+        spec=ServiceSpec(
+            name="storage-service",
+            image="example/storage-service:latest",
+            replicas=1,
+            cpu_request=0.2,
+            memory_request_mb=128,
+            port=8000,
+            env={"APP_MODE": "demo"},
+        ),
+        status=ResourceStatus.PENDING,
+        replicas=[],
+    )
+    await service_store.put("storage-service", service)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=secrets_manager,  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_service(service)
+
+    assert docker_client.created == 1
+    created_env = docker_client.created_envs[0]
+    assert created_env["APP_MODE"] == "demo"
+    assert created_env["AWS_LIGHT_SERVICE_NAME"] == "storage-service"
+    assert created_env["AWS_LIGHT_PROXY_URL"] == "http://proxy:8080"
+    assert created_env["AWS_LIGHT_STORAGE_URL"] == "http://proxy:8080/_aws-light/storage"
+    assert created_env["AWS_LIGHT_SERVICE_TOKEN"]
+    assert (
+        secrets_manager.created_secrets["aws-light-service-token-storage-service"]
+        == created_env["AWS_LIGHT_SERVICE_TOKEN"]
+    )
+
+
+async def test_create_replica_reuses_existing_platform_identity_token(
+    tmp_path: Path,
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    secrets_manager = FakeSecretsManager()
+    secrets_manager.created_secrets["aws-light-service-token-api"] = "existing-token"
+
+    service = ServiceState(
+        spec=ServiceSpec(
+            name="api",
+            image="example/api:latest",
+            replicas=1,
+            cpu_request=0.2,
+            memory_request_mb=128,
+            port=8000,
+        ),
+        status=ResourceStatus.PENDING,
+        replicas=[],
+    )
+    await service_store.put("api", service)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=secrets_manager,  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_service(service)
+
+    assert docker_client.created_envs[0]["AWS_LIGHT_SERVICE_TOKEN"] == "existing-token"
 
 
 async def test_collect_cpu_stats_updates_actual_node_usage(tmp_path: Path) -> None:

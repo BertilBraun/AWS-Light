@@ -12,6 +12,7 @@ from aws_light.storage.storage_service import StorageService
 # API route modules always import getters from here, never from a specific service main.
 
 _service_store: Any = None
+_database_store: Any = None
 _deployment_store: Any = None
 _node_store: Any = None
 _user_store: Any = None
@@ -26,6 +27,11 @@ _redis_client: Any = None
 def get_service_store() -> Any:
     assert _service_store is not None
     return _service_store
+
+
+def get_database_store() -> Any:
+    assert _database_store is not None
+    return _database_store
 
 
 def get_deployment_store() -> Any:

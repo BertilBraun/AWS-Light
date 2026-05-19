@@ -5,6 +5,7 @@ import pytest
 from aws_light.iac.parser import ManifestParseError, parse_manifests
 from aws_light.models.manifest import (
     BucketManifest,
+    DatabaseManifest,
     ManifestKind,
     SecretManifest,
     SecretsManifest,
@@ -133,3 +134,93 @@ spec:
     assert len(manifests) == 2
     assert isinstance(manifests[0], SecretsManifest)
     assert isinstance(manifests[1], BucketManifest)
+
+
+def test_parse_service_resource_bindings_and_ingress_policy() -> None:
+    yaml_text = """\
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: api
+spec:
+  image: api:latest
+  resources:
+    buckets:
+      - name: demo-objects
+        access: [read, write]
+    databases:
+      - name: app-db
+        access: [connect]
+  ingress:
+    external: true
+    internal:
+      allowFrom:
+        - frontend
+"""
+    manifests = parse_manifests(yaml_text)
+
+    assert isinstance(manifests[0], ServiceManifest)
+    assert manifests[0].spec.resources.buckets[0].name == "demo-objects"
+    assert manifests[0].spec.resources.buckets[0].access == ["read", "write"]
+    assert manifests[0].spec.resources.databases[0].name == "app-db"
+    assert manifests[0].spec.resources.databases[0].access == ["connect"]
+    assert manifests[0].spec.ingress.external is True
+    assert manifests[0].spec.ingress.internal.allow_from == ["frontend"]
+
+
+def test_parse_service_ingress_internal_boolean() -> None:
+    yaml_text = """\
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: shared
+spec:
+  image: shared:latest
+  ingress:
+    internal: true
+"""
+    manifests = parse_manifests(yaml_text)
+
+    assert isinstance(manifests[0], ServiceManifest)
+    assert manifests[0].spec.ingress.external is False
+    assert manifests[0].spec.ingress.internal.enabled is True
+    assert manifests[0].spec.ingress.internal.allow_from == []
+
+
+def test_parse_database_manifest() -> None:
+    yaml_text = """\
+apiVersion: aws-light/v1
+kind: Database
+metadata:
+  name: app-db
+spec:
+  engine: postgres
+  version: "16"
+  storageMb: 512
+"""
+    manifests = parse_manifests(yaml_text)
+
+    assert len(manifests) == 1
+    assert isinstance(manifests[0], DatabaseManifest)
+    assert manifests[0].kind == ManifestKind.DATABASE
+    assert manifests[0].metadata.name == "app-db"
+    assert manifests[0].spec.engine == "postgres"
+    assert manifests[0].spec.storage_mb == 512
+
+
+def test_parse_service_rejects_invalid_resource_access() -> None:
+    yaml_text = """\
+apiVersion: aws-light/v1
+kind: Service
+metadata:
+  name: bad
+spec:
+  image: bad:latest
+  resources:
+    buckets:
+      - name: demo-objects
+        access: [delete]
+"""
+
+    with pytest.raises(ManifestParseError):
+        parse_manifests(yaml_text)

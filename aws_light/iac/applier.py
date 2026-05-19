@@ -9,10 +9,12 @@ from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.manifest import (
     AnyManifest,
     BucketManifest,
+    DatabaseManifest,
     SecretManifest,
     SecretsManifest,
     ServiceManifest,
 )
+from aws_light.models.database import DatabaseSpec, DatabaseState
 from aws_light.models.service import ServiceSpec, ServiceState
 from aws_light.secrets.secrets_manager import SecretsManager
 from aws_light.storage.storage_service import StorageService
@@ -31,21 +33,39 @@ class Applier:
     def __init__(
         self,
         service_store: JsonStore[ServiceState],
+        database_store: JsonStore[DatabaseState],
         secrets_manager: SecretsManager,
         storage_service: StorageService,
         differ: Differ,
         event_bus: EventBus | None = None,
     ) -> None:
         self._service_store = service_store
+        self._database_store = database_store
         self._secrets_manager = secrets_manager
         self._storage_service = storage_service
         self._differ = differ
         self._event_bus = event_bus
 
     async def apply(self, manifests: list[AnyManifest]) -> list[ApplyResult]:
+        desired_bucket_names = {
+            manifest.metadata.name for manifest in manifests if isinstance(manifest, BucketManifest)
+        }
+        desired_database_names = {
+            manifest.metadata.name for manifest in manifests if isinstance(manifest, DatabaseManifest)
+        }
+        desired_service_names = {
+            manifest.metadata.name for manifest in manifests if isinstance(manifest, ServiceManifest)
+        }
         results = []
         for manifest in manifests:
-            results.extend(await self._apply_one(manifest))
+            results.extend(
+                await self._apply_one(
+                    manifest,
+                    desired_bucket_names,
+                    desired_database_names,
+                    desired_service_names,
+                )
+            )
         return results
 
     async def destroy(self, manifests: list[AnyManifest]) -> list[ApplyResult]:
@@ -61,10 +81,25 @@ class Applier:
             diffs.append(self._differ.compute_diff(manifest, current))
         return diffs
 
-    async def _apply_one(self, manifest: AnyManifest) -> list[ApplyResult]:
+    async def _apply_one(
+        self,
+        manifest: AnyManifest,
+        desired_bucket_names: set[str] | None = None,
+        desired_database_names: set[str] | None = None,
+        desired_service_names: set[str] | None = None,
+    ) -> list[ApplyResult]:
+        desired_bucket_names = desired_bucket_names or set()
+        desired_database_names = desired_database_names or set()
+        desired_service_names = desired_service_names or set()
         try:
             match manifest:
                 case ServiceManifest():
+                    await self._validate_service_bindings(
+                        manifest,
+                        desired_bucket_names,
+                        desired_database_names,
+                        desired_service_names,
+                    )
                     return [await self._apply_service(manifest)]
                 case SecretManifest():
                     return [await self._apply_secret(manifest.metadata.name, manifest.spec.value)]
@@ -75,6 +110,8 @@ class Applier:
                     ]
                 case BucketManifest():
                     return [await self._apply_bucket(manifest)]
+                case DatabaseManifest():
+                    return [await self._apply_database(manifest)]
                 case _:
                     return [
                         ApplyResult(
@@ -85,10 +122,35 @@ class Applier:
             kind = manifest.kind.value
             name = (
                 manifest.metadata.name
-                if isinstance(manifest, ServiceManifest | SecretManifest | BucketManifest)
+                if isinstance(
+                    manifest, ServiceManifest | SecretManifest | BucketManifest | DatabaseManifest
+                )
                 else "bundle"
             )
             return [ApplyResult(kind=kind, name=name, action="error", detail=str(error))]
+
+    async def _validate_service_bindings(
+        self,
+        manifest: ServiceManifest,
+        desired_bucket_names: set[str],
+        desired_database_names: set[str],
+        desired_service_names: set[str],
+    ) -> None:
+        for binding in manifest.spec.resources.buckets:
+            if (
+                binding.name not in desired_bucket_names
+                and not self._storage_service.bucket_exists(binding.name)
+            ):
+                raise ValueError(f"Missing bucket resource: {binding.name}")
+        for binding in manifest.spec.resources.databases:
+            if (
+                binding.name not in desired_database_names
+                and not await self._database_store.exists(binding.name)
+            ):
+                raise ValueError(f"Missing database resource: {binding.name}")
+        for caller in manifest.spec.ingress.internal.allow_from:
+            if caller not in desired_service_names and not await self._service_store.exists(caller):
+                raise ValueError(f"Unknown internal ingress caller: {caller}")
 
     async def _apply_service(self, manifest: ServiceManifest) -> ApplyResult:
         name = manifest.metadata.name
@@ -106,6 +168,8 @@ class Applier:
             env=spec_data.env,
             secret_refs=spec_data.secret_refs,
             labels={**manifest.metadata.labels, **spec_data.labels},
+            resources=spec_data.resources,
+            ingress=spec_data.ingress,
         )
 
         existing = await self._service_store.get(name)
@@ -139,6 +203,27 @@ class Applier:
         self._storage_service.create_bucket(name)
         await self._emit(EventKind.BUCKET_CREATED, {"bucket_name": name})
         return ApplyResult(kind="Bucket", name=name, action="created")
+
+    async def _apply_database(self, manifest: DatabaseManifest) -> ApplyResult:
+        name = manifest.metadata.name
+        database_spec = DatabaseSpec(
+            name=name,
+            engine=manifest.spec.engine,
+            version=manifest.spec.version,
+            storage_mb=manifest.spec.storage_mb,
+        )
+        existing = await self._database_store.get(name)
+        if existing is None:
+            database_state = DatabaseState(spec=database_spec)
+            await self._database_store.put(name, database_state)
+            return ApplyResult(kind="Database", name=name, action="created")
+
+        from datetime import datetime
+
+        existing.spec = database_spec
+        existing.updated_at = datetime.utcnow()
+        await self._database_store.put(name, existing)
+        return ApplyResult(kind="Database", name=name, action="updated")
 
     async def _destroy_one(self, manifest: AnyManifest) -> list[ApplyResult]:
         try:
@@ -192,10 +277,25 @@ class Applier:
                             detail="deleted",
                         )
                     ]
+                case DatabaseManifest() if await self._database_store.exists(
+                    manifest.metadata.name
+                ):
+                    await self._database_store.delete(manifest.metadata.name)
+                    return [
+                        ApplyResult(
+                            kind=manifest.kind.value,
+                            name=manifest.metadata.name,
+                            action="updated",
+                            detail="deleted",
+                        )
+                    ]
                 case _:
                     name = (
                         manifest.metadata.name
-                        if isinstance(manifest, ServiceManifest | SecretManifest | BucketManifest)
+                        if isinstance(
+                            manifest,
+                            ServiceManifest | SecretManifest | BucketManifest | DatabaseManifest,
+                        )
                         else "bundle"
                     )
                     return [
@@ -210,7 +310,9 @@ class Applier:
             kind = manifest.kind.value
             name = (
                 manifest.metadata.name
-                if isinstance(manifest, ServiceManifest | SecretManifest | BucketManifest)
+                if isinstance(
+                    manifest, ServiceManifest | SecretManifest | BucketManifest | DatabaseManifest
+                )
                 else "bundle"
             )
             return [ApplyResult(kind=kind, name=name, action="error", detail=str(error))]
