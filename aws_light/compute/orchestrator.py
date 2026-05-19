@@ -301,7 +301,7 @@ class ComputeOrchestrator:
 
             if not replica.container_ip:
                 replica.container_ip = self._docker_client.get_container_ip(
-                    replica.container_id, settings.docker_network
+                    replica.container_id, _service_network_name(spec.name)
                 )
                 changed = True
 
@@ -482,6 +482,7 @@ class ComputeOrchestrator:
         platform_env = await self._platform_env(spec.name)
         database_env = await self._database_env(service_state)
         merged_env = {**spec.env, **secret_env, **platform_env, **database_env}
+        service_network = self._ensure_service_network(spec.name)
 
         try:
             container_id, container_ip = self._docker_client.create_container(
@@ -490,9 +491,9 @@ class ComputeOrchestrator:
                 env=merged_env,
                 cpu_quota=spec.cpu_request,
                 memory_mb=spec.memory_request_mb,
-                network=settings.docker_network,
+                network=service_network,
                 labels=labels,
-            container_port=spec.port,
+                container_port=spec.port,
             )
         except Exception:
             logger.exception("Failed to create container for %s", spec.name)
@@ -643,7 +644,6 @@ class ComputeOrchestrator:
         self, service_state: ServiceState, container_id: str
     ) -> None:
         network_name = self._ensure_service_network(service_state.spec.name)
-        self._docker_client.connect_container_to_network(container_id, network_name)
         database_names = [
             binding.name
             for binding in service_state.spec.resources.databases

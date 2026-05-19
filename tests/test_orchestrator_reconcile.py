@@ -34,6 +34,8 @@ class FakeDockerClient:
         self.created_images: list[str] = []
         self.created_names: list[str] = []
         self.created_labels: list[dict[str, str]] = []
+        self.created_networks: list[str] = []
+        self.ip_network_requests: list[tuple[str, str]] = []
         self.ensured_networks: list[str] = []
         self.network_connections: list[tuple[str, str]] = []
         self.compose_containers: list[ComposeContainerInfo] = []
@@ -48,6 +50,7 @@ class FakeDockerClient:
         return container_id in self.running_containers
 
     def get_container_ip(self, container_id: str, network: str) -> str:
+        self.ip_network_requests.append((container_id, network))
         return f"10.0.0.{abs(hash(container_id)) % 200 + 1}"
 
     def remove_container(self, container_id: str) -> None:
@@ -70,6 +73,7 @@ class FakeDockerClient:
         self.created_images.append(image)
         self.created_names.append(name)
         self.created_labels.append(labels)
+        self.created_networks.append(network)
         container_id = f"new-container-{self.created}"
         self.running_containers.add(container_id)
         return container_id, f"10.0.1.{self.created}"
@@ -335,6 +339,102 @@ async def test_create_replica_reuses_existing_platform_identity_token(
     assert docker_client.created_envs[0]["AWS_LIGHT_SERVICE_TOKEN"] == "existing-token"
 
 
+async def test_create_replica_uses_service_network_as_primary_network(
+    tmp_path: Path,
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+
+    service = ServiceState(
+        spec=ServiceSpec(
+            name="api",
+            image="example/api:latest",
+            replicas=1,
+            cpu_request=0.2,
+            memory_request_mb=128,
+            port=8000,
+        ),
+        status=ResourceStatus.PENDING,
+        replicas=[],
+    )
+    await service_store.put("api", service)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_service(service)
+
+    assert docker_client.created_networks == ["aws-light-svc-api"]
+
+
+async def test_refresh_observed_replicas_reads_ip_from_service_network(
+    tmp_path: Path,
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers={"container-alive"})
+
+    service = ServiceState(
+        spec=ServiceSpec(
+            name="api",
+            image="example/api:latest",
+            replicas=1,
+            cpu_request=0.2,
+            memory_request_mb=128,
+            port=8000,
+        ),
+        status=ResourceStatus.RUNNING,
+        replicas=[
+            ReplicaState(
+                replica_id="replica-alive",
+                container_id="container-alive",
+                node_id="node-00",
+                status=ResourceStatus.RUNNING,
+                container_ip="",
+                image="example/api:latest",
+                started_at=datetime.utcnow(),
+            )
+        ],
+    )
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    updated = await orchestrator._refresh_observed_replicas(service)
+
+    assert docker_client.ip_network_requests == [
+        ("container-alive", "aws-light-svc-api")
+    ]
+    assert updated.replicas[0].container_ip
+
+
 async def test_create_replica_injects_bound_database_env(tmp_path: Path) -> None:
     service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
     database_store: JsonStore[DatabaseState] = JsonStore(tmp_path / "databases.json", DatabaseState)
@@ -538,7 +638,7 @@ async def test_bound_service_and_database_join_service_network(tmp_path: Path) -
 
     assert "aws-light-svc-api" in docker_client.ensured_networks
     assert ("new-container-1", "aws-light-svc-api") in docker_client.network_connections
-    assert ("new-container-2", "aws-light-svc-api") in docker_client.network_connections
+    assert docker_client.created_networks[1] == "aws-light-svc-api"
 
 
 async def test_proxy_and_health_checker_join_service_network(tmp_path: Path) -> None:
