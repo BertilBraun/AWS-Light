@@ -59,6 +59,10 @@ def _database_identifier(database_name: str) -> str:
     return database_name.lower().replace("-", "_")
 
 
+def _service_network_name(service_name: str) -> str:
+    return f"aws-light-svc-{service_name}"
+
+
 class ComputeOrchestrator:
     def __init__(
         self,
@@ -183,6 +187,7 @@ class ComputeOrchestrator:
         database_state.container_ip = container_ip
         database_state.updated_at = datetime.utcnow()
         await self._database_store.put(spec.name, database_state)  # type: ignore[union-attr]
+        await self._attach_database_to_bound_service_networks(database_state)
 
     async def _teardown_database(self, database_state: DatabaseState) -> None:
         if database_state.container_id:
@@ -475,11 +480,12 @@ class ComputeOrchestrator:
                 memory_mb=spec.memory_request_mb,
                 network=settings.docker_network,
                 labels=labels,
-                container_port=spec.port,
+            container_port=spec.port,
             )
         except Exception:
             logger.exception("Failed to create container for %s", spec.name)
             return
+        await self._attach_service_replica_networks(service_state, container_id)
 
         self._node_manager.allocate(
             target_node.spec.node_id, replica_id, spec.cpu_request, spec.memory_request_mb
@@ -620,6 +626,44 @@ class ComputeOrchestrator:
         password = secrets.token_urlsafe(24)
         await self._secrets_manager.create_secret(secret_name, password)
         return password
+
+    async def _attach_service_replica_networks(
+        self, service_state: ServiceState, container_id: str
+    ) -> None:
+        database_names = [
+            binding.name
+            for binding in service_state.spec.resources.databases
+            if "connect" in binding.access
+        ]
+        if not database_names:
+            return
+        network_name = _service_network_name(service_state.spec.name)
+        self._docker_client.ensure_network(network_name)
+        self._docker_client.connect_container_to_network(container_id, network_name)
+        if self._database_store is None:
+            return
+        for database_name in database_names:
+            database = await self._database_store.get(database_name)
+            if database is not None and database.container_id:
+                self._docker_client.connect_container_to_network(
+                    database.container_id, network_name
+                )
+
+    async def _attach_database_to_bound_service_networks(
+        self, database_state: DatabaseState
+    ) -> None:
+        for service_state in await self._service_store.list():
+            bound = any(
+                binding.name == database_state.spec.name and "connect" in binding.access
+                for binding in service_state.spec.resources.databases
+            )
+            if not bound:
+                continue
+            network_name = _service_network_name(service_state.spec.name)
+            self._docker_client.ensure_network(network_name)
+            self._docker_client.connect_container_to_network(
+                database_state.container_id, network_name
+            )
 
     async def _remove_orphan_containers(self) -> None:
         known_container_ids: set[str] = set()

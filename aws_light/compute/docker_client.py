@@ -48,6 +48,21 @@ class DockerClient:
         except docker.errors.NotFound:
             self._client.networks.create(network_name, driver="bridge")
 
+    def connect_container_to_network(self, container_id: str, network_name: str) -> None:
+        try:
+            network = self._client.networks.get(network_name)
+            container: Container = self._client.containers.get(container_id)
+            network.connect(container)
+        except docker.errors.APIError as error:
+            if "already exists" not in str(error).lower():
+                raise
+        except docker.errors.NotFound:
+            logger.warning(
+                "Could not connect container %s to missing network %s",
+                container_id[:12],
+                network_name,
+            )
+
     def pull_image(self, image: str) -> None:
         self._client.images.pull(image)
 

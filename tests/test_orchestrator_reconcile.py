@@ -34,6 +34,14 @@ class FakeDockerClient:
         self.created_images: list[str] = []
         self.created_names: list[str] = []
         self.created_labels: list[dict[str, str]] = []
+        self.ensured_networks: list[str] = []
+        self.network_connections: list[tuple[str, str]] = []
+
+    def ensure_network(self, network_name: str) -> None:
+        self.ensured_networks.append(network_name)
+
+    def connect_container_to_network(self, container_id: str, network_name: str) -> None:
+        self.network_connections.append((container_id, network_name))
 
     def container_is_running(self, container_id: str) -> bool:
         return container_id in self.running_containers
@@ -477,6 +485,54 @@ async def test_reconcile_all_marks_missing_database_container_pending(
     assert updated.status == ResourceStatus.PENDING
     assert updated.container_id == ""
     assert updated.container_name == ""
+
+
+async def test_bound_service_and_database_join_service_network(tmp_path: Path) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    database_store: JsonStore[DatabaseState] = JsonStore(tmp_path / "databases.json", DatabaseState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    secrets_manager = FakeSecretsManager()
+    await database_store.put("app-db", DatabaseState(spec=DatabaseSpec(name="app-db")))
+    service = ServiceState(
+        spec=ServiceSpec(
+            name="api",
+            image="example/api:latest",
+            replicas=1,
+            cpu_request=0.2,
+            memory_request_mb=128,
+            port=8000,
+            resources=ServiceResourceBindings(
+                databases=[DatabaseBinding(name="app-db", access=["connect"])]
+            ),
+        ),
+        status=ResourceStatus.PENDING,
+        replicas=[],
+    )
+    await service_store.put("api", service)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        database_store=database_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=secrets_manager,  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    assert "aws-light-svc-api" in docker_client.ensured_networks
+    assert ("new-container-1", "aws-light-svc-api") in docker_client.network_connections
+    assert ("new-container-2", "aws-light-svc-api") in docker_client.network_connections
 
 
 async def test_collect_cpu_stats_updates_actual_node_usage(tmp_path: Path) -> None:
