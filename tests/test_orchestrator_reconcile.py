@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from aws_light.compute.docker_client import ComposeContainerInfo, ContainerStats
+from aws_light.compute.docker_client import ComposeContainerInfo, ContainerInfo, ContainerStats
 from aws_light.compute.node_manager import NodeManager
 from aws_light.compute.orchestrator import ComputeOrchestrator
 from aws_light.compute.scheduler import BinPackScheduler
@@ -86,6 +86,11 @@ class FakeDockerClient:
     ) -> list[ComposeContainerInfo]:
         return self.compose_containers
 
+    def list_containers_by_label(
+        self, label_key: str, label_value: str
+    ) -> list[ContainerInfo]:
+        return []
+
 
 class FakeEventBus:
     def __init__(self) -> None:
@@ -115,6 +120,40 @@ class FakeRedis:
 
     async def set(self, key: str, value: object) -> None:
         self.values[key] = value
+
+
+async def test_start_does_not_ensure_shared_workload_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    node_manager = NodeManager()
+    docker_client = FakeDockerClient(running_containers=set())
+
+    def fake_create_task(coro: object) -> object:
+        close = getattr(coro, "close", None)
+        if close is not None:
+            close()
+        return object()
+
+    monkeypatch.setattr("aws_light.compute.orchestrator.asyncio.create_task", fake_create_task)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=FakeEventBus(),  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator.start()
+
+    assert "aws-light-data" not in docker_client.ensured_networks
 
 
 async def test_reconcile_replaces_missing_running_replica(tmp_path: Path) -> None:

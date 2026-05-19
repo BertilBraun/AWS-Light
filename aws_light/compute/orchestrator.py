@@ -99,7 +99,6 @@ class ComputeOrchestrator:
 
     async def start(self) -> None:
         self._running = True
-        self._docker_client.ensure_network(settings.docker_network)
         self._node_manager.initialize()
         await self._remove_orphan_containers()
         asyncio.create_task(self._reconcile_loop())
