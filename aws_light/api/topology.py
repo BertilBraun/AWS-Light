@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends
 from aws_light.dependencies import (
     get_database_store,
     get_node_store,
+    get_redis_client,
     get_routing_table,
     get_service_store,
     get_storage_service,
@@ -22,6 +23,7 @@ async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, obj
     buckets = get_storage_service().list_buckets()
     nodes = await get_node_store().list()
     routing_table = get_routing_table()
+    proxy_traffic = await _proxy_traffic_by_service()
     routed_endpoints_by_service = {
         service_name: await routing_table.get_endpoints(service_name)
         for service_name in await routing_table.all_service_names()
@@ -107,6 +109,11 @@ async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, obj
             )
         )
         graph_edges.append(_edge("proxy", service_id, "routes requests"))
+        traffic_metadata = proxy_traffic.get(service.spec.name)
+        if traffic_metadata is not None:
+            graph_edges.append(
+                _edge("proxy", service_id, "observed traffic", traffic_metadata)
+            )
         graph_edges.append(_edge("health-checker", service_id, "checks health"))
         graph_edges.append(_edge("autoscaler", service_id, "adjusts desired replicas"))
         for bucket_binding in service.spec.resources.buckets:
@@ -176,6 +183,73 @@ async def get_topology(_: UserSpec = Depends(get_current_user)) -> dict[str, obj
             graph_edges.append(_edge(replica_id, f"node:{replica.node_id}", "scheduled on"))
 
     return {"nodes": graph_nodes, "edges": graph_edges}
+
+
+async def _proxy_traffic_by_service() -> dict[str, dict[str, object]]:
+    redis_client = get_redis_client()
+    requests = _int_map(await redis_client.hgetall("proxy:requests:service"))
+    if not requests:
+        return {}
+
+    errors: dict[str, int] = {}
+    latency_sum: dict[str, int] = {}
+    latency_count: dict[str, int] = {}
+    for bucket_id in await _proxy_bucket_ids(redis_client):
+        for service, count in _int_map(
+            await redis_client.hgetall(f"proxy:ts:errors:{bucket_id}")
+        ).items():
+            errors[service] = errors.get(service, 0) + count
+        for service, centims in _int_map(
+            await redis_client.hgetall(f"proxy:ts:latency_sum:{bucket_id}")
+        ).items():
+            latency_sum[service] = latency_sum.get(service, 0) + centims
+        for service, count in _int_map(
+            await redis_client.hgetall(f"proxy:ts:latency_count:{bucket_id}")
+        ).items():
+            latency_count[service] = latency_count.get(service, 0) + count
+
+    return {
+        service: {
+            "requests_total": count,
+            "errors_total": errors.get(service, 0),
+            "avg_latency_ms": _latency_average_ms(
+                latency_sum.get(service, 0), latency_count.get(service, 0)
+            ),
+        }
+        for service, count in requests.items()
+    }
+
+
+async def _proxy_bucket_ids(redis_client: object) -> list[int]:
+    keys = await redis_client.keys("proxy:ts:requests:*")  # type: ignore[attr-defined]
+    bucket_ids = []
+    for key in keys:
+        normalized = key.decode() if isinstance(key, bytes) else key
+        try:
+            bucket_ids.append(int(normalized.rsplit(":", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return sorted(bucket_ids)
+
+
+def _int_map(values: dict[object, object]) -> dict[str, int]:
+    return {
+        _decode(key): int(value)
+        for key, value in values.items()
+        if str(value).lstrip("-").isdigit()
+    }
+
+
+def _decode(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def _latency_average_ms(latency_sum_centims: int, latency_count: int) -> float:
+    if latency_count <= 0:
+        return 0.0
+    return round((latency_sum_centims / 100) / latency_count, 2)
 
 
 def _node(

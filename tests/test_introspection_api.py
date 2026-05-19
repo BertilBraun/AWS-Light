@@ -201,6 +201,34 @@ def test_topology_includes_resource_bindings_and_ingress_policy(
     assert ("service:api", "service:frontend", "allowed internal ingress") in edge_pairs
 
 
+def test_topology_includes_observed_proxy_traffic_edges(client: TestClient) -> None:
+    client.portal.call(_seed_introspection_state)
+    client.portal.call(_seed_platform_metrics_and_events)
+    response = client.get("/api/v1/platform/topology", headers=_auth_headers(client))
+
+    assert response.status_code == 200
+    traffic_edges = [
+        edge
+        for edge in response.json()["edges"]
+        if edge["source"] == "proxy"
+        and edge["target"] == "service:secret-service"
+        and edge["label"] == "observed traffic"
+    ]
+
+    assert traffic_edges == [
+        {
+            "source": "proxy",
+            "target": "service:secret-service",
+            "label": "observed traffic",
+            "metadata": {
+                "requests_total": 3,
+                "errors_total": 1,
+                "avg_latency_ms": 15.0,
+            },
+        }
+    ]
+
+
 def test_introspection_requires_auth(client: TestClient) -> None:
     for path in [
         "/api/v1/overview",
