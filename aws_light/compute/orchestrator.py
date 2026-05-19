@@ -12,6 +12,7 @@ from aws_light.compute.scheduler import Scheduler, SchedulingError
 from aws_light.config import settings
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.models.common import ResourceStatus
+from aws_light.models.database import DatabaseState
 from aws_light.models.deployment import RolloutState
 from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.node import NodeState, ResourceUsage
@@ -31,6 +32,7 @@ _ROLLOUT_HEALTH_WAIT_INTERVAL = 2
 _ROLLOUT_HEALTH_WAIT_TIMEOUT = 60
 _PROXY_WORKLOAD_URL = "http://proxy:8080"
 _SERVICE_TOKEN_SECRET_PREFIX = "aws-light-service-token-"
+_DATABASE_PASSWORD_SECRET_PREFIX = "aws-light-database-"
 
 
 def _node_capacity_payload(node: NodeState) -> dict[str, object]:
@@ -48,6 +50,14 @@ def _node_capacity_payload(node: NodeState) -> dict[str, object]:
     }
 
 
+def _env_resource_name(resource_name: str) -> str:
+    return resource_name.upper().replace("-", "_")
+
+
+def _database_identifier(database_name: str) -> str:
+    return database_name.lower().replace("-", "_")
+
+
 class ComputeOrchestrator:
     def __init__(
         self,
@@ -59,6 +69,7 @@ class ComputeOrchestrator:
         event_bus: EventBus,
         routing_table: AnyRoutingTable,
         secrets_manager: SecretsManager,
+        database_store: AnyStore[DatabaseState] | None = None,
         redis_client: object | None = None,
         node_store: object | None = None,
     ) -> None:
@@ -70,6 +81,7 @@ class ComputeOrchestrator:
         self._event_bus = event_bus
         self._routing_table = routing_table
         self._secrets_manager = secrets_manager
+        self._database_store = database_store
         self._redis = redis_client
         self._node_store = node_store
         self._running = False
@@ -382,7 +394,8 @@ class ComputeOrchestrator:
 
         secret_env = await self._secrets_manager.inject_into_env(spec.secret_refs)
         platform_env = await self._platform_env(spec.name)
-        merged_env = {**spec.env, **secret_env, **platform_env}
+        database_env = await self._database_env(service_state)
+        merged_env = {**spec.env, **secret_env, **platform_env, **database_env}
 
         try:
             container_id, container_ip = self._docker_client.create_container(
@@ -499,6 +512,45 @@ class ComputeOrchestrator:
         token = secrets.token_urlsafe(32)
         await self._secrets_manager.create_secret(secret_name, token)
         return token
+
+    async def _database_env(self, service_state: ServiceState) -> dict[str, str]:
+        if self._database_store is None:
+            return {}
+        env: dict[str, str] = {}
+        for binding in service_state.spec.resources.databases:
+            if "connect" not in binding.access:
+                continue
+            database = await self._database_store.get(binding.name)
+            if database is None:
+                continue
+            env.update(await self._database_binding_env(database))
+        return env
+
+    async def _database_binding_env(self, database: DatabaseState) -> dict[str, str]:
+        database_name = database.spec.name
+        env_prefix = f"AWS_LIGHT_DATABASE_{_env_resource_name(database_name)}"
+        db_name = _database_identifier(database_name)
+        db_user = f"{db_name}_user"
+        db_host = f"aws-light-db-{database_name}"
+        db_port = "5432"
+        db_password = await self._database_password(database_name)
+        return {
+            f"{env_prefix}_URL": f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}",
+            f"{env_prefix}_HOST": db_host,
+            f"{env_prefix}_PORT": db_port,
+            f"{env_prefix}_NAME": db_name,
+            f"{env_prefix}_USER": db_user,
+            f"{env_prefix}_PASSWORD": db_password,
+        }
+
+    async def _database_password(self, database_name: str) -> str:
+        secret_name = f"{_DATABASE_PASSWORD_SECRET_PREFIX}{database_name}-password"
+        existing = await self._secrets_manager.get_secret(secret_name)
+        if existing:
+            return existing
+        password = secrets.token_urlsafe(24)
+        await self._secrets_manager.create_secret(secret_name, password)
+        return password
 
     async def _remove_orphan_containers(self) -> None:
         known_container_ids: set[str] = set()

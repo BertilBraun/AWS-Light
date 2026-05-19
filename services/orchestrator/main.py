@@ -15,6 +15,7 @@ from aws_light.compute.scheduler import create_scheduler
 from aws_light.config import settings
 from aws_light.events.redis_event_bus import RedisEventBus
 from aws_light.models.deployment import RolloutState
+from aws_light.models.database import DatabaseState
 from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.node import NodeState
 from aws_light.models.secret import SecretSpec
@@ -44,11 +45,12 @@ async def main() -> None:
     event_bus = RedisEventBus(redis_client)
 
     service_store: PostgresStore[ServiceState] = PostgresStore(pool, "services", ServiceState)
+    database_store: PostgresStore[DatabaseState] = PostgresStore(pool, "databases", DatabaseState)
     deployment_store: PostgresStore[RolloutState] = PostgresStore(pool, "deployments", RolloutState)
     secret_store: PostgresStore[SecretSpec] = PostgresStore(pool, "secrets", SecretSpec)
     node_store: PostgresStore[NodeState] = PostgresStore(pool, "nodes", NodeState)
 
-    for store in [service_store, deployment_store, secret_store, node_store]:
+    for store in [service_store, database_store, deployment_store, secret_store, node_store]:
         await store.create_table()
 
     routing_table = RedisRoutingTable(redis_client)
@@ -65,6 +67,7 @@ async def main() -> None:
         event_bus=event_bus,
         routing_table=routing_table,
         secrets_manager=secrets_manager,
+        database_store=database_store,
         redis_client=redis_client,
         node_store=node_store,
     )

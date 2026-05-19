@@ -10,9 +10,16 @@ from aws_light.compute.node_manager import NodeManager
 from aws_light.compute.orchestrator import ComputeOrchestrator
 from aws_light.compute.scheduler import BinPackScheduler
 from aws_light.models.common import ResourceStatus
+from aws_light.models.database import DatabaseSpec, DatabaseState
 from aws_light.models.deployment import RolloutState
 from aws_light.models.events import EventKind, WebSocketEvent
-from aws_light.models.service import ReplicaState, ServiceSpec, ServiceState
+from aws_light.models.service import (
+    DatabaseBinding,
+    ReplicaState,
+    ServiceResourceBindings,
+    ServiceSpec,
+    ServiceState,
+)
 from aws_light.proxy.routing_table import RoutingTable
 from aws_light.store.json_store import JsonStore
 
@@ -306,6 +313,71 @@ async def test_create_replica_reuses_existing_platform_identity_token(
     await orchestrator._reconcile_service(service)
 
     assert docker_client.created_envs[0]["AWS_LIGHT_SERVICE_TOKEN"] == "existing-token"
+
+
+async def test_create_replica_injects_bound_database_env(tmp_path: Path) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    database_store: JsonStore[DatabaseState] = JsonStore(tmp_path / "databases.json", DatabaseState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    secrets_manager = FakeSecretsManager()
+    await database_store.put(
+        "app-db",
+        DatabaseState(spec=DatabaseSpec(name="app-db", engine="postgres", version="16")),
+    )
+
+    service = ServiceState(
+        spec=ServiceSpec(
+            name="api",
+            image="example/api:latest",
+            replicas=1,
+            cpu_request=0.2,
+            memory_request_mb=128,
+            port=8000,
+            resources=ServiceResourceBindings(
+                databases=[DatabaseBinding(name="app-db", access=["connect"])]
+            ),
+        ),
+        status=ResourceStatus.PENDING,
+        replicas=[],
+    )
+    await service_store.put("api", service)
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        database_store=database_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=secrets_manager,  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_service(service)
+
+    created_env = docker_client.created_envs[0]
+    assert created_env["AWS_LIGHT_DATABASE_APP_DB_HOST"] == "aws-light-db-app-db"
+    assert created_env["AWS_LIGHT_DATABASE_APP_DB_PORT"] == "5432"
+    assert created_env["AWS_LIGHT_DATABASE_APP_DB_NAME"] == "app_db"
+    assert created_env["AWS_LIGHT_DATABASE_APP_DB_USER"] == "app_db_user"
+    assert created_env["AWS_LIGHT_DATABASE_APP_DB_PASSWORD"]
+    assert (
+        created_env["AWS_LIGHT_DATABASE_APP_DB_PASSWORD"]
+        == secrets_manager.created_secrets["aws-light-database-app-db-password"]
+    )
+    assert created_env["AWS_LIGHT_DATABASE_APP_DB_URL"].startswith(
+        "postgresql://app_db_user:"
+    )
+    assert created_env["AWS_LIGHT_DATABASE_APP_DB_URL"].endswith(
+        "@aws-light-db-app-db:5432/app_db"
+    )
 
 
 async def test_collect_cpu_stats_updates_actual_node_usage(tmp_path: Path) -> None:
