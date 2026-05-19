@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from redis.asyncio import Redis
 
     from aws_light.dashboard.event_bus import EventBus
+    from aws_light.models.service import ServiceState
+    from aws_light.secrets.secrets_manager import SecretsManager
+    from aws_light.store.base import AnyStore
 
 from aws_light.models.events import EventKind, WebSocketEvent
 
@@ -59,6 +62,14 @@ _400_RESPONSE = _error_response(
     b"HTTP/1.1 400 Bad Request",
     b'{"error": "bad request"}',
 )
+_403_RESPONSE = _error_response(
+    b"HTTP/1.1 403 Forbidden",
+    b'{"error": "external ingress denied"}',
+)
+_403_INTERNAL_RESPONSE = _error_response(
+    b"HTTP/1.1 403 Forbidden",
+    b'{"error": "internal ingress denied"}',
+)
 _501_RESPONSE = _error_response(
     b"HTTP/1.1 501 Not Implemented",
     b'{"error": "transfer encoding unsupported"}',
@@ -70,6 +81,8 @@ _PROXY_METRIC_BY_STATUS = "proxy:responses:status"
 _PROXY_METRIC_FAILURES = "proxy:failures"
 _PROXY_TIMESERIES_BUCKET_SECONDS = 10
 _PROXY_ACTIVITY_INTERVAL_SECONDS = 10.0
+_SERVICE_TOKEN_HEADER = b"x-aws-light-service-token"
+_SERVICE_TOKEN_SECRET_PREFIX = "aws-light-service-token-"
 
 
 class ProxyServer:
@@ -79,11 +92,15 @@ class ProxyServer:
         port: int,
         redis_client: Redis | None = None,  # type: ignore[type-arg]
         event_bus: EventBus | None = None,
+        service_store: AnyStore[ServiceState] | None = None,
+        secrets_manager: SecretsManager | None = None,
     ) -> None:
         self._balancer = balancer
         self._port = port
         self._redis = redis_client
         self._event_bus = event_bus
+        self._service_store = service_store
+        self._secrets_manager = secrets_manager
         self._server: asyncio.AbstractServer | None = None
         self._activity_task: asyncio.Task[None] | None = None
         self._traffic_lock = asyncio.Lock()
@@ -156,6 +173,26 @@ class ProxyServer:
             writer.write(_503_RESPONSE)
             await writer.drain()
             await self._record_proxy_result(None, 503, "missing_host", 0.0)
+            return
+
+        source_service = await self._source_service_from_request(header_bytes)
+        token_present = _header_value(header_bytes, _SERVICE_TOKEN_HEADER) is not None
+        if token_present:
+            if source_service is None or not await self._internal_ingress_allowed(
+                service_name, source_service
+            ):
+                writer.write(_403_INTERNAL_RESPONSE)
+                await writer.drain()
+                await self._record_proxy_result(
+                    service_name, 403, "internal_ingress_denied", 0.0
+                )
+                return
+        elif not await self._external_ingress_allowed(service_name):
+            writer.write(_403_RESPONSE)
+            await writer.drain()
+            await self._record_proxy_result(
+                service_name, 403, "external_ingress_denied", 0.0
+            )
             return
 
         try:
@@ -254,6 +291,40 @@ class ProxyServer:
             await upstream_writer.wait_closed()
             duration_ms = (time.perf_counter() - started) * 1000
             await self._record_proxy_result(service_name, status_code, None, duration_ms)
+
+    async def _external_ingress_allowed(self, service_name: str) -> bool:
+        if self._service_store is None:
+            return True
+        service_state = await self._service_store.get(service_name)
+        if service_state is None:
+            return False
+        return service_state.spec.ingress.external
+
+    async def _internal_ingress_allowed(self, service_name: str, source_service: str) -> bool:
+        if self._service_store is None:
+            return True
+        service_state = await self._service_store.get(service_name)
+        if service_state is None:
+            return False
+        policy = service_state.spec.ingress.internal
+        return policy.enabled or source_service in policy.allow_from
+
+    async def _source_service_from_request(self, header_bytes: bytes) -> str | None:
+        token_value = _header_value(header_bytes, _SERVICE_TOKEN_HEADER)
+        if token_value is None or self._secrets_manager is None:
+            return None
+        token = token_value.decode(errors="replace")
+        for secret_name in await self._secrets_manager.list_secret_names():
+            if not secret_name.startswith(_SERVICE_TOKEN_SECRET_PREFIX):
+                continue
+            stored_token = await self._secrets_manager.get_secret(secret_name)
+            if stored_token != token:
+                continue
+            service_name = secret_name.removeprefix(_SERVICE_TOKEN_SECRET_PREFIX)
+            if self._service_store is not None and await self._service_store.get(service_name) is None:
+                return None
+            return service_name
+        return None
 
     async def _record_proxy_result(
         self,

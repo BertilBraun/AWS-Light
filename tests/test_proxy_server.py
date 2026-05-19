@@ -3,10 +3,18 @@ from __future__ import annotations
 import asyncio
 
 from aws_light.dashboard.event_bus import EventBus
+from aws_light.models.service import (
+    InternalIngressPolicy,
+    ServiceIngressSpec,
+    ServiceSpec,
+    ServiceState,
+)
 from aws_light.proxy.proxy_server import (
     _502_RESPONSE,
     _503_RESPONSE,
     _504_RESPONSE,
+    _403_INTERNAL_RESPONSE,
+    _403_RESPONSE,
     ProxyServer,
     UpstreamResponseError,
     _extract_request_content_length,
@@ -53,11 +61,72 @@ class FakePipeline:
                 self.redis.values[key] = str(value)
 
 
+class FakeServiceStore:
+    def __init__(self, services: dict[str, ServiceState]) -> None:
+        self.services = services
+
+    async def get(self, identifier: str) -> ServiceState | None:
+        return self.services.get(identifier)
+
+
+class FakeSecretsManager:
+    def __init__(self, secrets: dict[str, str]) -> None:
+        self.secrets = secrets
+
+    async def list_secret_names(self) -> list[str]:
+        return list(self.secrets)
+
+    async def get_secret(self, name: str) -> str | None:
+        return self.secrets.get(name)
+
+
+class FakeBalancer:
+    def __init__(self) -> None:
+        self.requested_services: list[str] = []
+
+    async def healthy_replicas_for_request(self, service_name: str) -> list[object]:
+        self.requested_services.append(service_name)
+        raise AssertionError("Policy allowed request to reach load balancing")
+
+
+class FakeWriter:
+    def __init__(self) -> None:
+        self.data = b""
+
+    def write(self, data: bytes) -> None:
+        self.data += data
+
+    async def drain(self) -> None:
+        return None
+
+
 def _reader_with(data: bytes) -> asyncio.StreamReader:
     reader = asyncio.StreamReader()
     reader.feed_data(data)
     reader.feed_eof()
     return reader
+
+
+def _service_state(
+    name: str,
+    *,
+    external: bool = False,
+    internal: bool = False,
+    allow_from: list[str] | None = None,
+) -> ServiceState:
+    return ServiceState(
+        spec=ServiceSpec(
+            name=name,
+            image=f"example/{name}:latest",
+            ingress=ServiceIngressSpec(
+                external=external,
+                internal=InternalIngressPolicy(
+                    enabled=internal,
+                    allow_from=allow_from or [],
+                ),
+            ),
+        )
+    )
 
 
 async def test_read_http_head_returns_buffered_body_prefix() -> None:
@@ -131,11 +200,158 @@ async def test_read_full_response_rejects_incomplete_content_length_body() -> No
 
 
 def test_proxy_error_responses_have_matching_content_length() -> None:
-    for response in (_502_RESPONSE, _503_RESPONSE, _504_RESPONSE):
+    for response in (
+        _403_RESPONSE,
+        _403_INTERNAL_RESPONSE,
+        _502_RESPONSE,
+        _503_RESPONSE,
+        _504_RESPONSE,
+    ):
         head, body = response.split(b"\r\n\r\n", 1)
         content_length = _extract_request_content_length(head + b"\r\n\r\n")
 
         assert content_length == len(body)
+
+
+async def test_proxy_denies_external_request_when_service_not_exposed() -> None:
+    service_store = FakeServiceStore({"internal-api": _service_state("internal-api")})
+    balancer = FakeBalancer()
+    proxy = ProxyServer(
+        balancer=balancer,  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+    )
+    writer = FakeWriter()
+
+    await proxy._proxy_request(
+        _reader_with(b"GET / HTTP/1.1\r\nHost: internal-api.localhost\r\n\r\n"),
+        writer,  # type: ignore[arg-type]
+    )
+
+    assert writer.data == _403_RESPONSE
+    assert balancer.requested_services == []
+
+
+async def test_proxy_allows_external_request_when_service_is_exposed() -> None:
+    service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
+    proxy = ProxyServer(
+        balancer=FakeBalancer(),  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+    )
+    writer = FakeWriter()
+
+    try:
+        await proxy._proxy_request(
+            _reader_with(b"GET / HTTP/1.1\r\nHost: public-api.localhost\r\n\r\n"),
+            writer,  # type: ignore[arg-type]
+        )
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("Expected exposed service to reach load balancing")
+
+
+async def test_proxy_allows_internal_request_from_listed_caller() -> None:
+    service_store = FakeServiceStore(
+        {
+            "frontend": _service_state("frontend"),
+            "backend": _service_state("backend", allow_from=["frontend"]),
+        }
+    )
+    proxy = ProxyServer(
+        balancer=FakeBalancer(),  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+        secrets_manager=FakeSecretsManager(
+            {"aws-light-service-token-frontend": "frontend-token"}
+        ),  # type: ignore[arg-type]
+    )
+    writer = FakeWriter()
+
+    try:
+        await proxy._proxy_request(
+            _reader_with(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: backend.localhost\r\n"
+                b"X-AWS-Light-Service-Token: frontend-token\r\n"
+                b"\r\n"
+            ),
+            writer,  # type: ignore[arg-type]
+        )
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("Expected listed internal caller to reach load balancing")
+
+
+async def test_proxy_denies_internal_request_from_unlisted_caller() -> None:
+    service_store = FakeServiceStore(
+        {
+            "admin": _service_state("admin"),
+            "frontend": _service_state("frontend"),
+            "backend": _service_state("backend", allow_from=["frontend"]),
+        }
+    )
+    balancer = FakeBalancer()
+    proxy = ProxyServer(
+        balancer=balancer,  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+        secrets_manager=FakeSecretsManager(
+            {
+                "aws-light-service-token-admin": "admin-token",
+                "aws-light-service-token-frontend": "frontend-token",
+            }
+        ),  # type: ignore[arg-type]
+    )
+    writer = FakeWriter()
+
+    await proxy._proxy_request(
+        _reader_with(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: backend.localhost\r\n"
+            b"X-AWS-Light-Service-Token: admin-token\r\n"
+            b"\r\n"
+        ),
+        writer,  # type: ignore[arg-type]
+    )
+
+    assert writer.data == _403_INTERNAL_RESPONSE
+    assert balancer.requested_services == []
+
+
+async def test_proxy_allows_internal_request_when_target_is_broadly_internal() -> None:
+    service_store = FakeServiceStore(
+        {
+            "frontend": _service_state("frontend"),
+            "shared": _service_state("shared", internal=True),
+        }
+    )
+    proxy = ProxyServer(
+        balancer=FakeBalancer(),  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+        secrets_manager=FakeSecretsManager(
+            {"aws-light-service-token-frontend": "frontend-token"}
+        ),  # type: ignore[arg-type]
+    )
+    writer = FakeWriter()
+
+    try:
+        await proxy._proxy_request(
+            _reader_with(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: shared.localhost\r\n"
+                b"X-AWS-Light-Service-Token: frontend-token\r\n"
+                b"\r\n"
+            ),
+            writer,  # type: ignore[arg-type]
+        )
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("Expected broadly internal service to reach load balancing")
 
 
 def test_request_content_length_parsing() -> None:
