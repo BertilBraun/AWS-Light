@@ -304,10 +304,15 @@ class ComputeOrchestrator:
                 )
                 continue
 
-            if not replica.container_ip:
-                replica.container_ip = self._docker_client.get_container_ip(
-                    replica.container_id, _service_network_name(spec.name)
-                )
+            service_network = _service_network_name(spec.name)
+            self._docker_client.connect_container_to_network(
+                replica.container_id, service_network
+            )
+            service_network_ip = self._docker_client.get_container_ip(
+                replica.container_id, service_network
+            )
+            if service_network_ip and replica.container_ip != service_network_ip:
+                replica.container_ip = service_network_ip
                 changed = True
 
             self._node_manager.allocate(
