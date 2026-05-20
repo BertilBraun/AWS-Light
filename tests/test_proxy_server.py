@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 
-import httpx
-
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.models.service import (
     InternalIngressPolicy,
@@ -108,48 +106,6 @@ class StaticBalancer:
         return self.endpoints
 
 
-class FakeHttpStream:
-    def __init__(self, response: httpx.Response) -> None:
-        self.response = response
-
-    async def __aenter__(self) -> httpx.Response:
-        return self.response
-
-    async def __aexit__(self, *args: object) -> None:
-        return None
-
-
-class FakeUpstreamHttpClient:
-    def __init__(self, outcomes: list[httpx.Response | Exception]) -> None:
-        self.outcomes = list(outcomes)
-        self.requests: list[dict[str, object]] = []
-        self.closed = False
-
-    def stream(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: list[tuple[str, str]],
-        content: bytes,
-    ) -> FakeHttpStream:
-        self.requests.append(
-            {
-                "method": method,
-                "url": url,
-                "headers": headers,
-                "content": content,
-            }
-        )
-        outcome = self.outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return FakeHttpStream(outcome)
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
 class FakeWriter:
     def __init__(self) -> None:
         self.data = b""
@@ -180,6 +136,22 @@ class FakeUpstreamWriter(FakeWriter):
 
     async def wait_closed(self) -> None:
         return None
+
+
+class FakeOpenConnection:
+    def __init__(self, responses: list[bytes | Exception]) -> None:
+        self.responses = list(responses)
+        self.connections: list[tuple[str, int]] = []
+        self.writers: list[FakeUpstreamWriter] = []
+
+    async def __call__(self, host: str, port: int):  # type: ignore[no-untyped-def]
+        self.connections.append((host, port))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        writer = FakeUpstreamWriter()
+        self.writers.append(writer)
+        return _reader_with(response), writer
 
 
 def _reader_with(data: bytes) -> asyncio.StreamReader:
@@ -314,12 +286,13 @@ async def test_proxy_denies_external_request_when_service_not_exposed() -> None:
     assert balancer.requested_services == []
 
 
-async def test_proxy_forwards_platform_storage_path_before_ingress_policy() -> None:
+async def test_proxy_forwards_platform_storage_path_before_ingress_policy(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
     service_store = FakeServiceStore({"proxy:8080": _service_state("proxy:8080")})
     balancer = FakeBalancer()
-    upstream_client = FakeUpstreamHttpClient(
-        [httpx.Response(200, headers={"Content-Length": "2"}, stream=httpx.ByteStream(b"{}"))]
-    )
+    open_connection = FakeOpenConnection([b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"])
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
     proxy = ProxyServer(
         balancer=balancer,  # type: ignore[arg-type]
         port=8080,
@@ -327,7 +300,6 @@ async def test_proxy_forwards_platform_storage_path_before_ingress_policy() -> N
         secrets_manager=FakeSecretsManager(
             {"aws-light-service-token-combined-service": "combined-token"}
         ),  # type: ignore[arg-type]
-        upstream_http_client=upstream_client,  # type: ignore[arg-type]
     )
     writer = FakeWriter()
 
@@ -342,10 +314,8 @@ async def test_proxy_forwards_platform_storage_path_before_ingress_policy() -> N
     )
 
     assert b"HTTP/1.1 200 OK" in writer.data
-    assert upstream_client.requests[0]["url"] == (
-        "http://control-plane:8000/_aws-light/storage/buckets/combined-objects/objects"
-    )
-    assert ("Host", "control-plane:8000") in upstream_client.requests[0]["headers"]
+    assert open_connection.connections == [("control-plane", 8000)]
+    assert b"Host: control-plane:8000\r\n" in open_connection.writers[0].data
     assert balancer.requested_services == []
 
 
@@ -369,24 +339,27 @@ async def test_proxy_allows_external_request_when_service_is_exposed() -> None:
         raise AssertionError("Expected exposed service to reach load balancing")
 
 
-async def test_proxy_forwards_http_with_injected_upstream_client() -> None:
+async def test_proxy_forwards_http_over_raw_upstream_connection(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
     service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
-    upstream_client = FakeUpstreamHttpClient(
+    open_connection = FakeOpenConnection(
         [
-            httpx.Response(
-                201,
-                headers={"Content-Type": "application/json", "Connection": "keep-alive"},
-                stream=httpx.ByteStream(b'{"ok": true}'),
-            )
+            b"HTTP/1.1 201 Created\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 12\r\n"
+            b"Connection: keep-alive\r\n"
+            b"\r\n"
+            b'{"ok": true}'
         ]
     )
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
     proxy = ProxyServer(
         balancer=StaticBalancer(
             [ReplicaEndpoint("replica-1", "10.0.0.5", 9000, healthy=True)]
         ),  # type: ignore[arg-type]
         port=8080,
         service_store=service_store,  # type: ignore[arg-type]
-        upstream_http_client=upstream_client,  # type: ignore[arg-type]
     )
     writer = FakeWriter()
 
@@ -404,36 +377,40 @@ async def test_proxy_forwards_http_with_injected_upstream_client() -> None:
 
     assert writer.data == (
         b"HTTP/1.1 201 Created\r\n"
-        b"content-type: application/json\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 12\r\n"
         b"Connection: close\r\n"
         b"\r\n"
         b'{"ok": true}'
     )
-    assert upstream_client.requests == [
-        {
-            "method": "POST",
-            "url": "http://10.0.0.5:9000/items?x=1",
-            "headers": [("Host", "10.0.0.5:9000"), ("Content-Length", "4")],
-            "content": b"body",
-        }
-    ]
+    assert open_connection.connections == [("10.0.0.5", 9000)]
+    assert open_connection.writers[0].data == (
+        b"POST /items?x=1 HTTP/1.1\r\n"
+        b"Host: 10.0.0.5:9000\r\n"
+        b"Content-Length: 4\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"body"
+    )
 
 
-async def test_proxy_handles_multiple_http_requests_on_one_client_connection() -> None:
+async def test_proxy_handles_multiple_http_requests_on_one_client_connection(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
     service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
-    upstream_client = FakeUpstreamHttpClient(
+    open_connection = FakeOpenConnection(
         [
-            httpx.Response(200, headers={"Content-Length": "3"}, stream=httpx.ByteStream(b"one")),
-            httpx.Response(200, headers={"Content-Length": "3"}, stream=httpx.ByteStream(b"two")),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo",
         ]
     )
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
     proxy = ProxyServer(
         balancer=StaticBalancer(
             [ReplicaEndpoint("replica-1", "10.0.0.5", 9000, healthy=True)]
         ),  # type: ignore[arg-type]
         port=8080,
         service_store=service_store,  # type: ignore[arg-type]
-        upstream_http_client=upstream_client,  # type: ignore[arg-type]
     )
     writer = CloseAwareFakeWriter()
 
@@ -453,22 +430,22 @@ async def test_proxy_handles_multiple_http_requests_on_one_client_connection() -
     assert writer.data.count(b"HTTP/1.1 200 OK\r\n") == 2
     assert b"\r\nConnection: keep-alive\r\n\r\none" in writer.data
     assert writer.data.endswith(b"\r\nConnection: close\r\n\r\ntwo")
-    assert [request["url"] for request in upstream_client.requests] == [
-        "http://10.0.0.5:9000/one",
-        "http://10.0.0.5:9000/two",
-    ]
+    assert open_connection.connections == [("10.0.0.5", 9000), ("10.0.0.5", 9000)]
     assert writer.closed
     assert writer.waited_closed
 
 
-async def test_proxy_falls_back_to_next_http_replica_before_response_starts() -> None:
+async def test_proxy_falls_back_to_next_http_replica_before_response_starts(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
     service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
-    upstream_client = FakeUpstreamHttpClient(
+    open_connection = FakeOpenConnection(
         [
-            httpx.ConnectError("first replica failed"),
-            httpx.Response(200, headers={"Content-Length": "2"}, stream=httpx.ByteStream(b"ok")),
+            OSError("first replica failed"),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
         ]
     )
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
     proxy = ProxyServer(
         balancer=StaticBalancer(
             [
@@ -478,7 +455,6 @@ async def test_proxy_falls_back_to_next_http_replica_before_response_starts() ->
         ),  # type: ignore[arg-type]
         port=8080,
         service_store=service_store,  # type: ignore[arg-type]
-        upstream_http_client=upstream_client,  # type: ignore[arg-type]
     )
     writer = FakeWriter()
 
@@ -488,10 +464,7 @@ async def test_proxy_falls_back_to_next_http_replica_before_response_starts() ->
     )
 
     assert b"HTTP/1.1 200 OK\r\n" in writer.data
-    assert [request["url"] for request in upstream_client.requests] == [
-        "http://10.0.0.5:9000/",
-        "http://10.0.0.6:9001/",
-    ]
+    assert open_connection.connections == [("10.0.0.5", 9000), ("10.0.0.6", 9001)]
 
 
 async def test_proxy_allows_internal_request_from_listed_caller() -> None:

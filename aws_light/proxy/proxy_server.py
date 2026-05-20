@@ -7,8 +7,6 @@ import time
 from collections import Counter, defaultdict
 from typing import TYPE_CHECKING
 
-import httpx
-
 from aws_light.proxy.load_balancer import NoHealthyReplicaError, RoundRobinBalancer
 from aws_light.proxy.routing_table import ReplicaEndpoint
 
@@ -102,7 +100,6 @@ class ProxyServer:
         event_bus: EventBus | None = None,
         service_store: AnyStore[ServiceState] | None = None,
         secrets_manager: SecretsManager | None = None,
-        upstream_http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._balancer = balancer
         self._port = port
@@ -110,11 +107,6 @@ class ProxyServer:
         self._event_bus = event_bus
         self._service_store = service_store
         self._secrets_manager = secrets_manager
-        self._upstream_http_client = upstream_http_client or httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=1000, max_keepalive_connections=200),
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0),
-        )
-        self._owns_upstream_http_client = upstream_http_client is None
         self._server: asyncio.AbstractServer | None = None
         self._activity_task: asyncio.Task[None] | None = None
         self._metric_flush_task: asyncio.Task[None] | None = None
@@ -167,8 +159,6 @@ class ProxyServer:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
-        if self._owns_upstream_http_client:
-            await self._upstream_http_client.aclose()
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -390,7 +380,7 @@ class ProxyServer:
                     endpoint,
                     close_after_response,
                 )
-            except httpx.TimeoutException as error:
+            except (asyncio.TimeoutError, UpstreamResponseTimeout) as error:
                 timeout_seen = True
                 failures.append(f"{endpoint.replica_id[:8]} {endpoint.host}:{endpoint.port}")
                 logger.warning(
@@ -402,16 +392,7 @@ class ProxyServer:
                     error,
                 )
                 continue
-            except UpstreamStreamInterrupted as error:
-                duration_ms = (time.perf_counter() - started) * 1000
-                await self._record_proxy_result(
-                    metric_service,
-                    error.status_code,
-                    "upstream_stream_interrupted",
-                    duration_ms,
-                )
-                return True
-            except httpx.HTTPError as error:
+            except (OSError, UpstreamResponseError) as error:
                 failures.append(f"{endpoint.replica_id[:8]} {endpoint.host}:{endpoint.port}")
                 logger.warning(
                     "Proxy could not reach %s replica %s at %s:%d: %s",
@@ -450,30 +431,33 @@ class ProxyServer:
         close_after_response: bool,
     ) -> int:
         upstream_started = time.perf_counter()
-        method, target = _extract_request_method_and_target(header_bytes)
-        url = f"http://{endpoint.host}:{endpoint.port}{target}"
-        headers = _httpx_request_headers(header_bytes, endpoint.host, endpoint.port)
-        async with self._upstream_http_client.stream(
-            method,
-            url,
-            headers=headers,
-            content=body,
-        ) as response:
-            upstream_headers_ms = (time.perf_counter() - upstream_started) * 1000
-            await self._record_timing("upstream_headers", upstream_headers_ms)
-            writer.write(_httpx_response_head(response, close_after_response))
-            await writer.drain()
+        upstream_reader, upstream_writer = await asyncio.wait_for(
+            asyncio.open_connection(endpoint.host, endpoint.port), timeout=5.0
+        )
+        try:
+            rewritten_headers = _rewrite_request_headers(header_bytes, endpoint.host, endpoint.port)
+            upstream_writer.write(rewritten_headers)
+            if body:
+                upstream_writer.write(body)
+            await upstream_writer.drain()
+
+            upstream_response = await _read_full_response(
+                upstream_reader,
+                close_after_response=close_after_response,
+            )
+            await self._record_timing(
+                "upstream_headers",
+                (time.perf_counter() - upstream_started) * 1000,
+            )
+            status_code = _extract_response_status(upstream_response) or 502
             stream_started = time.perf_counter()
-            try:
-                async for chunk in response.aiter_raw():
-                    if not chunk:
-                        continue
-                    writer.write(chunk)
-                    await writer.drain()
-            except httpx.HTTPError as exc:
-                raise UpstreamStreamInterrupted(response.status_code) from exc
+            writer.write(upstream_response)
+            await writer.drain()
             await self._record_timing("stream", (time.perf_counter() - stream_started) * 1000)
-            return response.status_code
+            return status_code
+        finally:
+            upstream_writer.close()
+            await upstream_writer.wait_closed()
 
     async def _external_ingress_allowed(self, service_name: str) -> bool:
         if self._service_store is None:
@@ -833,7 +817,7 @@ def _rewrite_request_headers(header_bytes: bytes, upstream_host: str, upstream_p
     return b"\r\n".join(rewritten) + _HEADER_DELIMITER
 
 
-def _rewrite_response_headers(header_bytes: bytes) -> bytes:
+def _rewrite_response_headers(header_bytes: bytes, *, close_after_response: bool = True) -> bytes:
     lines = _header_lines(header_bytes)
     if not lines:
         return header_bytes
@@ -844,47 +828,11 @@ def _rewrite_response_headers(header_bytes: bytes) -> bytes:
         if name is None or name in _RESPONSE_HOP_BY_HOP_HEADERS:
             continue
         rewritten.append(line)
-    rewritten.append(b"Connection: close")
-    return b"\r\n".join(rewritten) + _HEADER_DELIMITER
-
-
-def _httpx_request_headers(
-    header_bytes: bytes,
-    upstream_host: str,
-    upstream_port: int,
-) -> list[tuple[str, str]]:
-    lines = _header_lines(header_bytes)
-    if not lines:
-        return []
-
-    headers = [("Host", f"{upstream_host}:{upstream_port}")]
-    for line in lines[1:]:
-        name = _header_name(line)
-        if name is None or name in _HOP_BY_HOP_HEADERS or name == b"host":
-            continue
-        raw_name, raw_value = line.split(b":", 1)
-        headers.append(
-            (
-                raw_name.decode(errors="replace"),
-                raw_value.strip().decode(errors="replace"),
-            )
-        )
-    return headers
-
-
-def _httpx_response_head(response: httpx.Response, close_after_response: bool) -> bytes:
-    reason = response.reason_phrase or ""
-    lines = [f"HTTP/1.1 {response.status_code} {reason}".rstrip().encode()]
-    for name, value in response.headers.multi_items():
-        header_name = name.encode().lower()
-        if header_name in _HOP_BY_HOP_HEADERS:
-            continue
-        lines.append(f"{name}: {value}".encode())
     if close_after_response:
-        lines.append(b"Connection: close")
+        rewritten.append(b"Connection: close")
     else:
-        lines.append(b"Connection: keep-alive")
-    return b"\r\n".join(lines) + _HEADER_DELIMITER
+        rewritten.append(b"Connection: keep-alive")
+    return b"\r\n".join(rewritten) + _HEADER_DELIMITER
 
 
 async def _pipe_stream(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
@@ -909,13 +857,11 @@ class UpstreamResponseTimeout(UpstreamResponseError):
     pass
 
 
-class UpstreamStreamInterrupted(UpstreamResponseError):
-    def __init__(self, status_code: int) -> None:
-        self.status_code = status_code
-        super().__init__(f"upstream stream interrupted after {status_code} response started")
-
-
-async def _read_full_response(reader: asyncio.StreamReader) -> bytes:
+async def _read_full_response(
+    reader: asyncio.StreamReader,
+    *,
+    close_after_response: bool = True,
+) -> bytes:
     try:
         header_bytes, body_prefix = await _read_http_head(reader)
     except asyncio.TimeoutError as exc:
@@ -923,7 +869,10 @@ async def _read_full_response(reader: asyncio.StreamReader) -> bytes:
     if not header_bytes:
         raise UpstreamResponseError
 
-    rewritten_headers = _rewrite_response_headers(header_bytes)
+    rewritten_headers = _rewrite_response_headers(
+        header_bytes,
+        close_after_response=close_after_response,
+    )
     content_length = _extract_content_length(header_bytes)
     if content_length is None:
         chunks = [rewritten_headers, body_prefix]
