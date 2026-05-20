@@ -35,6 +35,8 @@ def test_combined_stack_manifest_uses_all_platform_features() -> None:
 
     combined = services["combined-service"]
     assert combined.spec.ingress.external is True
+    assert combined.spec.env["COMBINED_BUCKET_NAME"] == "combined-objects"
+    assert combined.spec.env["COMBINED_DATABASE_BINDING"] == "combined-db"
     assert combined.spec.resources.buckets[0].name == "combined-objects"
     assert combined.spec.resources.buckets[0].access == ["read", "write"]
     assert combined.spec.resources.databases[0].name == "combined-db"
@@ -80,6 +82,20 @@ def test_combined_service_accepts_demo_token_query_parameter(monkeypatch) -> Non
 
     assert combined.resolve_demo_token("", "demo-secret") == "demo-secret"
     assert combined.resolve_demo_token("header-secret", "demo-secret") == "header-secret"
+
+
+def test_combined_service_reads_bucket_and_database_binding_from_env(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    combined = _load_combined_service()
+    monkeypatch.setenv("COMBINED_BUCKET_NAME", "configured-bucket")
+    monkeypatch.setenv("COMBINED_DATABASE_BINDING", "configured-db")
+    monkeypatch.setenv("AWS_LIGHT_STORAGE_URL", "http://proxy:8080/_aws-light/storage")
+
+    assert combined.bucket_name() == "configured-bucket"
+    assert combined.database_binding() == "configured-db"
+    assert (
+        combined.object_url("example.txt")
+        == "http://proxy:8080/_aws-light/storage/buckets/configured-bucket/objects/example.txt"
+    )
 
 
 async def test_combined_service_database_flow_awaits_connection(monkeypatch) -> None:  # type: ignore[no-untyped-def]

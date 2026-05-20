@@ -6,8 +6,8 @@ from fastapi import FastAPI, Header, HTTPException
 
 app = FastAPI()
 
-BUCKET_NAME = "combined-objects"
-DATABASE_BINDING = "combined-db"
+DEFAULT_BUCKET_NAME = "combined-objects"
+DEFAULT_DATABASE_BINDING = "combined-db"
 
 
 @app.get("/health")
@@ -57,7 +57,7 @@ async def exercise_storage() -> dict[str, object]:
         get_response = await client.get(object_url(key), headers=storage_headers())
     _raise_platform_error(put_response)
     _raise_platform_error(get_response)
-    return {"bucket": BUCKET_NAME, "key": key, "bytes": len(get_response.content)}
+    return {"bucket": bucket_name(), "key": key, "bytes": len(get_response.content)}
 
 
 async def exercise_database() -> dict[str, object]:
@@ -78,7 +78,7 @@ async def exercise_database() -> dict[str, object]:
         )
         count = await connection.fetchval("select count(*) from combined_events")
         return {
-            "database": database_settings(DATABASE_BINDING)["database"],
+            "database": database_settings(database_binding())["database"],
             "inserted_id": row["id"],
             "event_count": count,
             "created_at": row["created_at"].astimezone(timezone.utc).isoformat(),
@@ -124,7 +124,7 @@ def object_url(key: str) -> str:
     storage_url = os.environ.get(
         "AWS_LIGHT_STORAGE_URL", "http://proxy:8080/_aws-light/storage"
     ).rstrip("/")
-    return f"{storage_url}/buckets/{BUCKET_NAME}/objects/{key}"
+    return f"{storage_url}/buckets/{bucket_name()}/objects/{key}"
 
 
 def storage_headers(content_type: str | None = None) -> dict[str, str]:
@@ -151,7 +151,7 @@ async def _connect():  # type: ignore[no-untyped-def]
         import asyncpg
     except ImportError as error:
         raise HTTPException(status_code=500, detail="asyncpg is not installed") from error
-    url = database_settings(DATABASE_BINDING)["url"]
+    url = database_settings(database_binding())["url"]
     if not url:
         raise HTTPException(status_code=500, detail="database binding is not configured")
     return await asyncpg.connect(str(url))
@@ -174,6 +174,14 @@ def _raise_platform_error(response: httpx.Response) -> None:
 
 def _env_resource_name(resource_name: str) -> str:
     return resource_name.upper().replace("-", "_")
+
+
+def bucket_name() -> str:
+    return os.environ.get("COMBINED_BUCKET_NAME", DEFAULT_BUCKET_NAME)
+
+
+def database_binding() -> str:
+    return os.environ.get("COMBINED_DATABASE_BINDING", DEFAULT_DATABASE_BINDING)
 
 
 if __name__ == "__main__":

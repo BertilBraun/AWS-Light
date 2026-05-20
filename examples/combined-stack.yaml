@@ -73,6 +73,9 @@ spec:
   memoryRequestMb: 160
   port: 8000
   healthCheckPath: /health
+  env:
+    COMBINED_BUCKET_NAME: combined-objects
+    COMBINED_DATABASE_BINDING: combined-db
   secretRefs:
     - combined-api-token
   resources:
