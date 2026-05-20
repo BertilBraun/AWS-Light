@@ -21,7 +21,11 @@ async def root() -> JSONResponse:
         content={
             "service": "internal-frontend",
             "backend_status": response.status_code,
-            "backend": response.json() if response.headers.get("content-type") == "application/json" else response.text,
+            "backend": (
+                response.json()
+                if response.headers.get("content-type") == "application/json"
+                else response.text
+            ),
         },
     )
 

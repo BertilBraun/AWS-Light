@@ -29,8 +29,8 @@ from aws_light.events.redis_event_bus import RedisEventBus
 from aws_light.iac.applier import Applier
 from aws_light.iac.differ import Differ
 from aws_light.iam.auth import make_default_admin
-from aws_light.models.deployment import RolloutState
 from aws_light.models.database import DatabaseState
+from aws_light.models.deployment import RolloutState
 from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.iam import UserSpec
 from aws_light.models.node import NodeState

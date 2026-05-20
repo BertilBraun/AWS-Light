@@ -4,7 +4,12 @@ from fastapi.testclient import TestClient
 
 import aws_light.dependencies as deps
 from aws_light.models.common import ResourceStatus
-from aws_light.models.service import BucketBinding, ServiceResourceBindings, ServiceSpec, ServiceState
+from aws_light.models.service import (
+    BucketBinding,
+    ServiceResourceBindings,
+    ServiceSpec,
+    ServiceState,
+)
 from aws_light.storage.presigned import PresignedUrlService
 from aws_light.storage.storage_service import StorageService
 

@@ -14,8 +14,8 @@ from aws_light.compute.orchestrator import ComputeOrchestrator
 from aws_light.compute.scheduler import create_scheduler
 from aws_light.config import settings
 from aws_light.events.redis_event_bus import RedisEventBus
-from aws_light.models.deployment import RolloutState
 from aws_light.models.database import DatabaseState
+from aws_light.models.deployment import RolloutState
 from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.node import NodeState
 from aws_light.models.secret import SecretSpec

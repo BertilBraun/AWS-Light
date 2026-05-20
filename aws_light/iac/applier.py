@@ -5,6 +5,7 @@ from typing import Literal
 
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.iac.differ import Differ, ManifestDiff
+from aws_light.models.database import DatabaseSpec, DatabaseState
 from aws_light.models.events import EventKind, WebSocketEvent
 from aws_light.models.manifest import (
     AnyManifest,
@@ -14,7 +15,6 @@ from aws_light.models.manifest import (
     SecretsManifest,
     ServiceManifest,
 )
-from aws_light.models.database import DatabaseSpec, DatabaseState
 from aws_light.models.service import ServiceSpec, ServiceState
 from aws_light.secrets.secrets_manager import SecretsManager
 from aws_light.storage.storage_service import StorageService
@@ -48,13 +48,19 @@ class Applier:
 
     async def apply(self, manifests: list[AnyManifest]) -> list[ApplyResult]:
         desired_bucket_names = {
-            manifest.metadata.name for manifest in manifests if isinstance(manifest, BucketManifest)
+            manifest.metadata.name
+            for manifest in manifests
+            if isinstance(manifest, BucketManifest)
         }
         desired_database_names = {
-            manifest.metadata.name for manifest in manifests if isinstance(manifest, DatabaseManifest)
+            manifest.metadata.name
+            for manifest in manifests
+            if isinstance(manifest, DatabaseManifest)
         }
         desired_service_names = {
-            manifest.metadata.name for manifest in manifests if isinstance(manifest, ServiceManifest)
+            manifest.metadata.name
+            for manifest in manifests
+            if isinstance(manifest, ServiceManifest)
         }
         results = []
         for manifest in manifests:

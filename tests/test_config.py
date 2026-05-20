@@ -4,7 +4,6 @@ import yaml
 
 from aws_light.config import Settings
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
