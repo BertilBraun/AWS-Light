@@ -85,6 +85,7 @@ _PROXY_METRIC_FAILURES = "proxy:failures"
 _PROXY_TIMESERIES_BUCKET_SECONDS = 10
 _PROXY_ACTIVITY_INTERVAL_SECONDS = 10.0
 _PROXY_METRIC_FLUSH_INTERVAL_SECONDS = 1.0
+_PROXY_TIMING_LOG_INTERVAL_SECONDS = 5.0
 _SERVICE_TOKEN_HEADER = b"x-aws-light-service-token"
 _SERVICE_TOKEN_SECRET_PREFIX = "aws-light-service-token-"
 _PLATFORM_STORAGE_PREFIX = "/_aws-light/storage"
@@ -117,6 +118,7 @@ class ProxyServer:
         self._server: asyncio.AbstractServer | None = None
         self._activity_task: asyncio.Task[None] | None = None
         self._metric_flush_task: asyncio.Task[None] | None = None
+        self._timing_task: asyncio.Task[None] | None = None
         self._traffic_lock = asyncio.Lock()
         self._traffic_total = 0
         self._traffic_by_service: Counter[str] = Counter()
@@ -134,6 +136,10 @@ class ProxyServer:
         self._metric_ts_latency_sum: defaultdict[int, Counter[str]] = defaultdict(Counter)
         self._metric_ts_latency_count: defaultdict[int, Counter[str]] = defaultdict(Counter)
         self._metric_ts_errors: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._timing_lock = asyncio.Lock()
+        self._timing_counts: Counter[str] = Counter()
+        self._timing_sums_ms: defaultdict[str, float] = defaultdict(float)
+        self._timing_max_ms: dict[str, float] = {}
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_connection, "0.0.0.0", self._port)
@@ -141,9 +147,14 @@ class ProxyServer:
             self._activity_task = asyncio.create_task(self._traffic_activity_loop())
         if self._redis is not None:
             self._metric_flush_task = asyncio.create_task(self._metric_flush_loop())
+        self._timing_task = asyncio.create_task(self._timing_log_loop())
         logger.info("Proxy server listening on port %d", self._port)
 
     async def stop(self) -> None:
+        if self._timing_task is not None:
+            self._timing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._timing_task
         if self._metric_flush_task is not None:
             self._metric_flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -165,10 +176,15 @@ class ProxyServer:
         buffered = b""
         try:
             while True:
+                request_started = time.perf_counter()
                 close_after_request, buffered = await self._proxy_request(
                     reader,
                     writer,
                     buffered,
+                )
+                await self._record_timing(
+                    "total",
+                    (time.perf_counter() - request_started) * 1000,
                 )
                 if close_after_request or (not buffered and reader.at_eof()):
                     break
@@ -184,7 +200,9 @@ class ProxyServer:
         writer: asyncio.StreamWriter,
         buffered: bytes = b"",
     ) -> tuple[bool, bytes]:
+        request_started = time.perf_counter()
         header_bytes, body_prefix = await _read_http_head(reader, buffered)
+        await self._record_timing("read", (time.perf_counter() - request_started) * 1000)
         if not header_bytes:
             return True, b""
 
@@ -236,12 +254,14 @@ class ProxyServer:
             await self._record_proxy_result(None, 503, "missing_host", 0.0)
             return True, b""
 
+        auth_started = time.perf_counter()
         source_service = await self._source_service_from_request(header_bytes)
         token_present = _header_value(header_bytes, _SERVICE_TOKEN_HEADER) is not None
         if token_present:
             if source_service is None or not await self._internal_ingress_allowed(
                 service_name, source_service
             ):
+                await self._record_timing("auth", (time.perf_counter() - auth_started) * 1000)
                 writer.write(_403_INTERNAL_RESPONSE)
                 await writer.drain()
                 await self._record_proxy_result(
@@ -249,20 +269,25 @@ class ProxyServer:
                 )
                 return True, b""
         elif not await self._external_ingress_allowed(service_name):
+            await self._record_timing("auth", (time.perf_counter() - auth_started) * 1000)
             writer.write(_403_RESPONSE)
             await writer.drain()
             await self._record_proxy_result(
                 service_name, 403, "external_ingress_denied", 0.0
             )
             return True, b""
+        await self._record_timing("auth", (time.perf_counter() - auth_started) * 1000)
 
+        route_started = time.perf_counter()
         try:
             endpoints = await self._balancer.healthy_replicas_for_request(service_name)
         except NoHealthyReplicaError:
+            await self._record_timing("route", (time.perf_counter() - route_started) * 1000)
             writer.write(_503_RESPONSE)
             await writer.drain()
             await self._record_proxy_result(service_name, 503, "no_healthy_replica", 0.0)
             return True, b""
+        await self._record_timing("route", (time.perf_counter() - route_started) * 1000)
 
         is_websocket = _is_websocket_upgrade(header_bytes)
         if not is_websocket:
@@ -424,6 +449,7 @@ class ProxyServer:
         endpoint: ReplicaEndpoint,
         close_after_response: bool,
     ) -> int:
+        upstream_started = time.perf_counter()
         method, target = _extract_request_method_and_target(header_bytes)
         url = f"http://{endpoint.host}:{endpoint.port}{target}"
         headers = _httpx_request_headers(header_bytes, endpoint.host, endpoint.port)
@@ -433,8 +459,11 @@ class ProxyServer:
             headers=headers,
             content=body,
         ) as response:
+            upstream_headers_ms = (time.perf_counter() - upstream_started) * 1000
+            await self._record_timing("upstream_headers", upstream_headers_ms)
             writer.write(_httpx_response_head(response, close_after_response))
             await writer.drain()
+            stream_started = time.perf_counter()
             try:
                 async for chunk in response.aiter_raw():
                     if not chunk:
@@ -443,6 +472,7 @@ class ProxyServer:
                     await writer.drain()
             except httpx.HTTPError as exc:
                 raise UpstreamStreamInterrupted(response.status_code) from exc
+            await self._record_timing("stream", (time.perf_counter() - stream_started) * 1000)
             return response.status_code
 
     async def _external_ingress_allowed(self, service_name: str) -> bool:
@@ -610,6 +640,55 @@ class ProxyServer:
             self._traffic_by_status[status_code] += 1
             if failure_reason:
                 self._traffic_failures[failure_reason] += 1
+
+    async def _record_timing(self, stage: str, duration_ms: float) -> None:
+        async with self._timing_lock:
+            self._timing_counts[stage] += 1
+            self._timing_sums_ms[stage] += duration_ms
+            self._timing_max_ms[stage] = max(
+                duration_ms,
+                self._timing_max_ms.get(stage, 0.0),
+            )
+
+    async def _timing_snapshot(self) -> dict[str, dict[str, float | int]]:
+        async with self._timing_lock:
+            counts = Counter(self._timing_counts)
+            sums_ms = dict(self._timing_sums_ms)
+            max_ms = dict(self._timing_max_ms)
+            self._timing_counts.clear()
+            self._timing_sums_ms.clear()
+            self._timing_max_ms.clear()
+        return {
+            stage: {
+                "count": count,
+                "avg_ms": round(sums_ms[stage] / count, 2),
+                "max_ms": round(max_ms.get(stage, 0.0), 2),
+            }
+            for stage, count in counts.items()
+            if count
+        }
+
+    async def _timing_log_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_PROXY_TIMING_LOG_INTERVAL_SECONDS)
+            await self._log_timing_snapshot()
+
+    async def _log_timing_snapshot(self) -> None:
+        snapshot = await self._timing_snapshot()
+        if not snapshot:
+            return
+        parts = [
+            (
+                f"{stage}=count:{values['count']} "
+                f"avg:{values['avg_ms']:.2f}ms max:{values['max_ms']:.2f}ms"
+            )
+            for stage, values in sorted(snapshot.items())
+        ]
+        logger.info(
+            "Proxy timing summary over %.0fs: %s",
+            _PROXY_TIMING_LOG_INTERVAL_SECONDS,
+            "; ".join(parts),
+        )
 
     async def _traffic_activity_loop(self) -> None:
         while True:
