@@ -80,3 +80,41 @@ def test_combined_service_accepts_demo_token_query_parameter(monkeypatch) -> Non
 
     assert combined.resolve_demo_token("", "demo-secret") == "demo-secret"
     assert combined.resolve_demo_token("header-secret", "demo-secret") == "header-secret"
+
+
+async def test_combined_service_database_flow_awaits_connection(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    combined = _load_combined_service()
+    monkeypatch.setenv("AWS_LIGHT_DATABASE_COMBINED_DB_NAME", "combined_db")
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def execute(self, statement: str) -> None:
+            assert "create table if not exists combined_events" in statement
+
+        async def fetchrow(self, statement: str, message: str) -> dict[str, object]:
+            assert "insert into combined_events" in statement
+            assert message == "combined-service aggregate request"
+            return {"id": 7, "created_at": combined.datetime.now(combined.timezone.utc)}
+
+        async def fetchval(self, statement: str) -> int:
+            assert statement == "select count(*) from combined_events"
+            return 3
+
+        async def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+
+    async def fake_connect() -> FakeConnection:
+        return connection
+
+    monkeypatch.setattr(combined, "_connect", fake_connect)
+
+    result = await combined.exercise_database()
+
+    assert result["database"] == "combined_db"
+    assert result["inserted_id"] == 7
+    assert result["event_count"] == 3
+    assert connection.closed is True

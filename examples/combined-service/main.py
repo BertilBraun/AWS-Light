@@ -61,7 +61,8 @@ async def exercise_storage() -> dict[str, object]:
 
 
 async def exercise_database() -> dict[str, object]:
-    async with _connect() as connection:
+    connection = await _connect()
+    try:
         await connection.execute(
             """
             create table if not exists combined_events (
@@ -76,12 +77,14 @@ async def exercise_database() -> dict[str, object]:
             "combined-service aggregate request",
         )
         count = await connection.fetchval("select count(*) from combined_events")
-    return {
-        "database": database_settings(DATABASE_BINDING)["database"],
-        "inserted_id": row["id"],
-        "event_count": count,
-        "created_at": row["created_at"].astimezone(timezone.utc).isoformat(),
-    }
+        return {
+            "database": database_settings(DATABASE_BINDING)["database"],
+            "inserted_id": row["id"],
+            "event_count": count,
+            "created_at": row["created_at"].astimezone(timezone.utc).isoformat(),
+        }
+    finally:
+        await connection.close()
 
 
 async def call_cpu_service() -> list[dict[str, object]]:
