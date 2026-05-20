@@ -94,17 +94,6 @@ curl.exe -H "Host: combined-service.localhost" "http://localhost:8080/?demo_toke
 - [Operations and troubleshooting](docs/operations.md)
 - [Future work](docs/future-work.md)
 
-## Performance Notes
-
-AWS-Light is a local simulator, not a production proxy or scheduler. The proxy
-hot path has still had some practical tuning: hot store reads are cached, Redis
-metric writes are buffered, and normal HTTP forwarding uses a raw upstream path
-with explicit connection handling. On a laptop test run, proxy throughput improved
-from roughly 130-150 RPS to roughly 600 RPS at 200 concurrent connections.
-
-Those numbers are environment-specific. The project favors clear architecture
-and observability over maximum throughput.
-
 ## Development
 
 Run tests:
