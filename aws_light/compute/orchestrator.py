@@ -141,6 +141,8 @@ class ComputeOrchestrator:
             await self._teardown_database(database_state)
             return
 
+        expected_container_name = f"aws-light-db-{database_state.spec.name}"
+        database_network = _database_network_name(database_state.spec.name)
         if database_state.container_id:
             if self._docker_client.container_is_running(database_state.container_id):
                 if database_state.status != ResourceStatus.RUNNING:
@@ -157,6 +159,27 @@ class ComputeOrchestrator:
             database_state.updated_at = datetime.utcnow()
             await self._database_store.put(database_state.spec.name, database_state)  # type: ignore[union-attr]
             return
+
+        existing = self._docker_client.get_container_by_name(expected_container_name)
+        if existing is not None:
+            if self._docker_client.container_is_running(existing.container_id):
+                database_state.status = ResourceStatus.RUNNING
+                database_state.container_id = existing.container_id
+                database_state.container_name = expected_container_name
+                database_state.container_ip = self._docker_client.get_container_ip(
+                    existing.container_id,
+                    database_network,
+                )
+                database_state.updated_at = datetime.utcnow()
+                await self._database_store.put(database_state.spec.name, database_state)  # type: ignore[union-attr]
+                await self._attach_database_to_bound_service_networks(database_state)
+                return
+            logger.info(
+                "Removing stale database container %s before recreating %s",
+                existing.container_id[:12],
+                database_state.spec.name,
+            )
+            self._docker_client.remove_container(existing.container_id)
 
         await self._create_database_container(database_state)
 

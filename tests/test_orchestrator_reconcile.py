@@ -27,6 +27,7 @@ from aws_light.store.json_store import JsonStore
 class FakeDockerClient:
     def __init__(self, running_containers: set[str]) -> None:
         self.running_containers = running_containers
+        self.containers_by_name: dict[str, ContainerInfo] = {}
         self.created = 0
         self.removed: list[str] = []
         self.stats: dict[str, ContainerStats] = {}
@@ -106,6 +107,9 @@ class FakeDockerClient:
         self, label_key: str, label_value: str
     ) -> list[ContainerInfo]:
         return []
+
+    def get_container_by_name(self, name: str) -> ContainerInfo | None:
+        return self.containers_by_name.get(name)
 
 
 class FakeEventBus:
@@ -666,6 +670,92 @@ async def test_reconcile_all_provisions_pending_database_container(tmp_path: Pat
         == secrets_manager.created_secrets["aws-light-database-app-db-password"]
     )
     assert docker_client.created_labels[0]["aws-light.database"] == "app-db"
+
+
+async def test_reconcile_all_adopts_running_database_container_by_name(
+    tmp_path: Path,
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    database_store: JsonStore[DatabaseState] = JsonStore(tmp_path / "databases.json", DatabaseState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers={"existing-db-container"})
+    docker_client.containers_by_name["aws-light-db-app-db"] = ContainerInfo(
+        container_id="existing-db-container",
+        name="aws-light-db-app-db",
+        status="running",
+        labels={"aws-light.database": "app-db"},
+    )
+    docker_client.container_ips[("existing-db-container", "aws-light-db-app-db")] = "10.0.2.5"
+    await database_store.put("app-db", DatabaseState(spec=DatabaseSpec(name="app-db")))
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        database_store=database_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    updated = await database_store.get("app-db")
+    assert updated is not None
+    assert updated.status == ResourceStatus.RUNNING
+    assert updated.container_id == "existing-db-container"
+    assert updated.container_name == "aws-light-db-app-db"
+    assert updated.container_ip == "10.0.2.5"
+    assert docker_client.created == 0
+
+
+async def test_reconcile_all_removes_stale_database_container_before_create(
+    tmp_path: Path,
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    database_store: JsonStore[DatabaseState] = JsonStore(tmp_path / "databases.json", DatabaseState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    docker_client.containers_by_name["aws-light-db-app-db"] = ContainerInfo(
+        container_id="stale-db-container",
+        name="aws-light-db-app-db",
+        status="exited",
+        labels={"aws-light.database": "app-db"},
+    )
+    await database_store.put("app-db", DatabaseState(spec=DatabaseSpec(name="app-db")))
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        database_store=database_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    updated = await database_store.get("app-db")
+    assert updated is not None
+    assert updated.status == ResourceStatus.RUNNING
+    assert updated.container_id == "new-container-1"
+    assert docker_client.removed == ["stale-db-container"]
+    assert docker_client.created == 1
 
 
 async def test_reconcile_all_marks_missing_database_container_pending(

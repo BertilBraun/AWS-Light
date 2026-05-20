@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any, cast
 
 import docker
 import docker.errors
@@ -115,7 +116,7 @@ class DockerClient:
             remove=False,
         )
         container_ip = self._poll_container_ip(container, network)
-        return container.id, container_ip  # type: ignore[return-value]
+        return str(container.id), container_ip
 
     def _poll_container_ip(self, container: Container, network: str) -> str:
         for _ in range(settings.container_ip_poll_retries):
@@ -123,7 +124,7 @@ class DockerClient:
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             ip = networks.get(network, {}).get("IPAddress", "")
             if ip:
-                return ip
+                return str(ip)
             time.sleep(0.2)
         logger.warning(
             "Could not get IP for container %s on network %s", container.id[:12], network
@@ -135,7 +136,7 @@ class DockerClient:
             container: Container = self._client.containers.get(container_id)
             container.reload()
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-            return networks.get(network, {}).get("IPAddress", "")  # type: ignore[no-any-return]
+            return str(networks.get(network, {}).get("IPAddress", ""))
         except docker.errors.NotFound:
             return ""
 
@@ -150,7 +151,7 @@ class DockerClient:
     def get_container_stats(self, container_id: str) -> ContainerStats | None:
         try:
             container: Container = self._client.containers.get(container_id)
-            raw_stats = container.stats(stream=False)
+            raw_stats = cast(dict[str, Any], container.stats(stream=False))
             cpu_percent = _calculate_cpu_percent(raw_stats)
             memory_bytes = raw_stats["memory_stats"].get("usage", 0)
             memory_mb = memory_bytes / (1024 * 1024)
@@ -163,12 +164,24 @@ class DockerClient:
         return [
             ContainerInfo(
                 container_id=container.id,
-                name=container.name,
-                status=container.status,
-                labels=container.labels,
+                name=str(container.name),
+                status=str(container.status),
+                labels=dict(container.labels or {}),
             )
             for container in containers
         ]
+
+    def get_container_by_name(self, name: str) -> ContainerInfo | None:
+        try:
+            container: Container = self._client.containers.get(name)
+            return ContainerInfo(
+                container_id=container.id,
+                name=str(container.name),
+                status=str(container.status),
+                labels=container.labels or {},
+            )
+        except docker.errors.NotFound:
+            return None
 
     def container_exists(self, container_id: str) -> bool:
         try:
@@ -181,14 +194,17 @@ class DockerClient:
         try:
             container: Container = self._client.containers.get(container_id)
             container.reload()
-            return container.status == "running"
+            return bool(container.status == "running")
         except docker.errors.NotFound:
             return False
 
     def get_container_logs(self, container_id: str, tail: int = 200) -> str:
         try:
             container: Container = self._client.containers.get(container_id)
-            raw_logs = container.logs(stdout=True, stderr=True, tail=tail, timestamps=True)
+            raw_logs = cast(
+                bytes,
+                container.logs(stdout=True, stderr=True, tail=tail, timestamps=True),
+            )
             return raw_logs.decode(errors="replace")
         except docker.errors.NotFound:
             return ""
@@ -234,7 +250,7 @@ class DockerClient:
         )
 
 
-def _calculate_cpu_percent(raw_stats: dict) -> float:  # type: ignore[type-arg]
+def _calculate_cpu_percent(raw_stats: dict[str, Any]) -> float:
     cpu_delta = (
         raw_stats["cpu_stats"]["cpu_usage"]["total_usage"]
         - raw_stats["precpu_stats"]["cpu_usage"]["total_usage"]
@@ -245,7 +261,7 @@ def _calculate_cpu_percent(raw_stats: dict) -> float:  # type: ignore[type-arg]
     num_cpus = raw_stats["cpu_stats"].get("online_cpus", 1)
     if system_delta <= 0 or cpu_delta < 0:
         return 0.0
-    return (cpu_delta / system_delta) * num_cpus * 100.0
+    return float((cpu_delta / system_delta) * num_cpus * 100.0)
 
 
 def _service_name_from_container(container_name: str) -> str:
