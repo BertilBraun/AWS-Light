@@ -163,21 +163,13 @@ class ProxyServer:
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        buffered = b""
         try:
-            while True:
-                request_started = time.perf_counter()
-                close_after_request, buffered = await self._proxy_request(
-                    reader,
-                    writer,
-                    buffered,
-                )
-                await self._record_timing(
-                    "total",
-                    (time.perf_counter() - request_started) * 1000,
-                )
-                if close_after_request or (not buffered and reader.at_eof()):
-                    break
+            request_started = time.perf_counter()
+            await self._proxy_request(reader, writer)
+            await self._record_timing(
+                "total",
+                (time.perf_counter() - request_started) * 1000,
+            )
         except Exception:
             logger.exception("Error handling proxy connection")
         finally:
@@ -188,29 +180,27 @@ class ProxyServer:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-        buffered: bytes = b"",
-    ) -> tuple[bool, bytes]:
+    ) -> None:
         request_started = time.perf_counter()
-        header_bytes, body_prefix = await _read_http_head(reader, buffered)
+        header_bytes, body_prefix = await _read_http_head(reader)
         await self._record_timing("read", (time.perf_counter() - request_started) * 1000)
         if not header_bytes:
-            return True, b""
+            return
 
         if _has_transfer_encoding(header_bytes):
             writer.write(_501_RESPONSE)
             await writer.drain()
             await self._record_proxy_result(None, 501, "unsupported_transfer_encoding", 0.0)
-            return True, b""
+            return
 
         content_length = _extract_request_content_length(header_bytes)
         if content_length is None:
             writer.write(_400_RESPONSE)
             await writer.drain()
             await self._record_proxy_result(None, 400, "bad_content_length", 0.0)
-            return True, b""
+            return
 
         body = body_prefix[:content_length]
-        buffered = body_prefix[content_length:]
         remaining_body_bytes = content_length - len(body)
         if remaining_body_bytes > 0:
             try:
@@ -221,28 +211,25 @@ class ProxyServer:
                 writer.write(_400_RESPONSE)
                 await writer.drain()
                 await self._record_proxy_result(None, 400, "incomplete_request_body", 0.0)
-                return True, b""
-
-        close_after_response = _request_connection_should_close(header_bytes)
+                return
 
         if _extract_request_path(header_bytes).startswith(_PLATFORM_STORAGE_PREFIX):
-            close_after_response = await self._forward_to_upstream(
+            await self._forward_to_upstream(
                 header_bytes,
                 body,
                 writer,
                 _CONTROL_PLANE_HOST,
                 _CONTROL_PLANE_PORT,
                 "__platform_storage__",
-                close_after_response,
             )
-            return close_after_response, buffered
+            return
 
         service_name = _extract_service_name(header_bytes)
         if service_name is None:
             writer.write(_503_RESPONSE)
             await writer.drain()
             await self._record_proxy_result(None, 503, "missing_host", 0.0)
-            return True, b""
+            return
 
         auth_started = time.perf_counter()
         source_service = await self._source_service_from_request(header_bytes)
@@ -257,7 +244,7 @@ class ProxyServer:
                 await self._record_proxy_result(
                     service_name, 403, "internal_ingress_denied", 0.0
                 )
-                return True, b""
+                return
         elif not await self._external_ingress_allowed(service_name):
             await self._record_timing("auth", (time.perf_counter() - auth_started) * 1000)
             writer.write(_403_RESPONSE)
@@ -265,7 +252,7 @@ class ProxyServer:
             await self._record_proxy_result(
                 service_name, 403, "external_ingress_denied", 0.0
             )
-            return True, b""
+            return
         await self._record_timing("auth", (time.perf_counter() - auth_started) * 1000)
 
         route_started = time.perf_counter()
@@ -276,20 +263,19 @@ class ProxyServer:
             writer.write(_503_RESPONSE)
             await writer.drain()
             await self._record_proxy_result(service_name, 503, "no_healthy_replica", 0.0)
-            return True, b""
+            return
         await self._record_timing("route", (time.perf_counter() - route_started) * 1000)
 
         is_websocket = _is_websocket_upgrade(header_bytes)
         if not is_websocket:
-            close_after_response = await self._forward_http_to_candidates(
+            await self._forward_http_to_candidates(
                 header_bytes,
                 body,
                 writer,
                 endpoints,
                 service_name,
-                close_after_response,
             )
-            return close_after_response, buffered
+            return
 
         started = time.perf_counter()
         upstream_reader: asyncio.StreamReader | None = None
@@ -325,7 +311,7 @@ class ProxyServer:
                 ", ".join(failures) or "none",
             )
             await self._record_proxy_result(service_name, 502, "upstream_unreachable", duration_ms)
-            return True, b""
+            return
 
         rewritten_headers = _rewrite_request_headers(header_bytes, endpoint.host, endpoint.port)
         upstream_writer.write(rewritten_headers)
@@ -338,7 +324,6 @@ class ProxyServer:
             _pipe_stream(upstream_reader, writer),
             return_exceptions=True,
         )
-        return True, b""
 
     async def _forward_to_upstream(
         self,
@@ -348,15 +333,13 @@ class ProxyServer:
         upstream_host: str,
         upstream_port: int,
         metric_service: str,
-        close_after_response: bool,
-    ) -> bool:
-        return await self._forward_http_to_candidates(
+    ) -> None:
+        await self._forward_http_to_candidates(
             header_bytes,
             body,
             writer,
             [ReplicaEndpoint(metric_service, upstream_host, upstream_port, healthy=True)],
             metric_service,
-            close_after_response,
         )
 
     async def _forward_http_to_candidates(
@@ -366,8 +349,7 @@ class ProxyServer:
         writer: asyncio.StreamWriter,
         endpoints: list[ReplicaEndpoint],
         metric_service: str,
-        close_after_response: bool,
-    ) -> bool:
+    ) -> None:
         started = time.perf_counter()
         failures: list[str] = []
         timeout_seen = False
@@ -378,7 +360,6 @@ class ProxyServer:
                     body,
                     writer,
                     endpoint,
-                    close_after_response,
                 )
             except (asyncio.TimeoutError, UpstreamResponseTimeout) as error:
                 timeout_seen = True
@@ -405,7 +386,7 @@ class ProxyServer:
                 continue
             duration_ms = (time.perf_counter() - started) * 1000
             await self._record_proxy_result(metric_service, status_code, None, duration_ms)
-            return close_after_response
+            return
 
         status_code = 504 if timeout_seen else 502
         failure_reason = "upstream_response_timeout" if timeout_seen else "upstream_unreachable"
@@ -420,7 +401,6 @@ class ProxyServer:
             ", ".join(failures) or "none",
         )
         await self._record_proxy_result(metric_service, status_code, failure_reason, duration_ms)
-        return True
 
     async def _forward_http_to_endpoint(
         self,
@@ -428,7 +408,6 @@ class ProxyServer:
         body: bytes,
         writer: asyncio.StreamWriter,
         endpoint: ReplicaEndpoint,
-        close_after_response: bool,
     ) -> int:
         upstream_started = time.perf_counter()
         upstream_reader, upstream_writer = await asyncio.wait_for(
@@ -441,10 +420,7 @@ class ProxyServer:
                 upstream_writer.write(body)
             await upstream_writer.drain()
 
-            upstream_response = await _read_full_response(
-                upstream_reader,
-                close_after_response=close_after_response,
-            )
+            upstream_response = await _read_full_response(upstream_reader)
             await self._record_timing(
                 "upstream_headers",
                 (time.perf_counter() - upstream_started) * 1000,
@@ -718,11 +694,8 @@ class ProxyServer:
         )
 
 
-async def _read_http_head(
-    reader: asyncio.StreamReader,
-    buffered: bytes = b"",
-) -> tuple[bytes, bytes]:
-    buffer = buffered
+async def _read_http_head(reader: asyncio.StreamReader) -> tuple[bytes, bytes]:
+    buffer = b""
     while _HEADER_DELIMITER not in buffer:
         chunk = await asyncio.wait_for(reader.read(4096), timeout=10.0)
         if not chunk:
@@ -758,35 +731,6 @@ def _extract_request_path(header_bytes: bytes) -> str:
     return parts[1].decode(errors="replace")
 
 
-def _extract_request_method_and_target(header_bytes: bytes) -> tuple[str, str]:
-    request_line = header_bytes.split(b"\r\n", 1)[0]
-    parts = request_line.split()
-    if len(parts) < 2:
-        return "GET", "/"
-    method = parts[0].decode(errors="replace")
-    target = parts[1].decode(errors="replace") or "/"
-    if not target.startswith("/"):
-        target = "/"
-    return method, target
-
-
-def _request_connection_should_close(header_bytes: bytes) -> bool:
-    connection_value = _header_value(header_bytes, b"connection")
-    if connection_value is not None:
-        tokens = {
-            token.strip().lower()
-            for token in connection_value.split(b",")
-        }
-        if b"close" in tokens:
-            return True
-        if b"keep-alive" in tokens:
-            return False
-
-    request_line = header_bytes.split(b"\r\n", 1)[0]
-    parts = request_line.split()
-    return len(parts) >= 3 and parts[2].upper() == b"HTTP/1.0"
-
-
 def _is_websocket_upgrade(header_bytes: bytes) -> bool:
     return b"upgrade: websocket" in header_bytes.lower()
 
@@ -817,7 +761,7 @@ def _rewrite_request_headers(header_bytes: bytes, upstream_host: str, upstream_p
     return b"\r\n".join(rewritten) + _HEADER_DELIMITER
 
 
-def _rewrite_response_headers(header_bytes: bytes, *, close_after_response: bool = True) -> bytes:
+def _rewrite_response_headers(header_bytes: bytes) -> bytes:
     lines = _header_lines(header_bytes)
     if not lines:
         return header_bytes
@@ -828,10 +772,7 @@ def _rewrite_response_headers(header_bytes: bytes, *, close_after_response: bool
         if name is None or name in _RESPONSE_HOP_BY_HOP_HEADERS:
             continue
         rewritten.append(line)
-    if close_after_response:
-        rewritten.append(b"Connection: close")
-    else:
-        rewritten.append(b"Connection: keep-alive")
+    rewritten.append(b"Connection: close")
     return b"\r\n".join(rewritten) + _HEADER_DELIMITER
 
 
@@ -857,11 +798,7 @@ class UpstreamResponseTimeout(UpstreamResponseError):
     pass
 
 
-async def _read_full_response(
-    reader: asyncio.StreamReader,
-    *,
-    close_after_response: bool = True,
-) -> bytes:
+async def _read_full_response(reader: asyncio.StreamReader) -> bytes:
     try:
         header_bytes, body_prefix = await _read_http_head(reader)
     except asyncio.TimeoutError as exc:
@@ -869,10 +806,7 @@ async def _read_full_response(
     if not header_bytes:
         raise UpstreamResponseError
 
-    rewritten_headers = _rewrite_response_headers(
-        header_bytes,
-        close_after_response=close_after_response,
-    )
+    rewritten_headers = _rewrite_response_headers(header_bytes)
     content_length = _extract_content_length(header_bytes)
     if content_length is None:
         chunks = [rewritten_headers, body_prefix]

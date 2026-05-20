@@ -22,7 +22,6 @@ from aws_light.proxy.proxy_server import (
     _has_transfer_encoding,
     _read_full_response,
     _read_http_head,
-    _request_connection_should_close,
     _rewrite_request_headers,
     _rewrite_response_headers,
 )
@@ -394,7 +393,7 @@ async def test_proxy_forwards_http_over_raw_upstream_connection(
     )
 
 
-async def test_proxy_handles_multiple_http_requests_on_one_client_connection(
+async def test_proxy_closes_client_connection_after_one_http_request(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
     service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
@@ -427,10 +426,9 @@ async def test_proxy_handles_multiple_http_requests_on_one_client_connection(
         writer,  # type: ignore[arg-type]
     )
 
-    assert writer.data.count(b"HTTP/1.1 200 OK\r\n") == 2
-    assert b"\r\nConnection: keep-alive\r\n\r\none" in writer.data
-    assert writer.data.endswith(b"\r\nConnection: close\r\n\r\ntwo")
-    assert open_connection.connections == [("10.0.0.5", 9000), ("10.0.0.5", 9000)]
+    assert writer.data.count(b"HTTP/1.1 200 OK\r\n") == 1
+    assert writer.data.endswith(b"\r\nConnection: close\r\n\r\none")
+    assert open_connection.connections == [("10.0.0.5", 9000)]
     assert writer.closed
     assert writer.waited_closed
 
@@ -575,17 +573,6 @@ def test_request_content_length_parsing() -> None:
     bad_content_length = b"POST / HTTP/1.1\r\nContent-Length: bad\r\n\r\n"
     assert _extract_request_content_length(bad_content_length) is None
     assert _has_transfer_encoding(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
-
-
-def test_request_connection_close_parsing() -> None:
-    assert not _request_connection_should_close(b"GET / HTTP/1.1\r\nHost: svc\r\n\r\n")
-    assert _request_connection_should_close(
-        b"GET / HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n"
-    )
-    assert _request_connection_should_close(b"GET / HTTP/1.0\r\nHost: svc\r\n\r\n")
-    assert not _request_connection_should_close(
-        b"GET / HTTP/1.0\r\nHost: svc\r\nConnection: keep-alive\r\n\r\n"
-    )
 
 
 def test_extract_response_status() -> None:
