@@ -666,18 +666,9 @@ async def test_proxy_publishes_aggregated_traffic_activity() -> None:
     assert events[-1].payload["responses_by_status"] == {"200": 1, "502": 1}
 
 
-async def test_proxy_timing_snapshot_resets_aggregated_stage_timings() -> None:
+def test_proxy_does_not_keep_temporary_stage_timing_state() -> None:
     proxy = ProxyServer(balancer=None, port=8080)  # type: ignore[arg-type]
 
-    await proxy._record_timing("read", 1.0)
-    await proxy._record_timing("read", 3.0)
-    await proxy._record_timing("route", 2.0)
-
-    snapshot = await proxy._timing_snapshot()
-    second_snapshot = await proxy._timing_snapshot()
-
-    assert snapshot == {
-        "read": {"count": 2, "avg_ms": 2.0, "max_ms": 3.0},
-        "route": {"count": 1, "avg_ms": 2.0, "max_ms": 2.0},
-    }
-    assert second_snapshot == {}
+    assert not hasattr(proxy, "_timing_task")
+    assert not hasattr(proxy, "_timing_counts")
+    assert not hasattr(proxy, "_record_timing")
