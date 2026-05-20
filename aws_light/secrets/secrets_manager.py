@@ -3,11 +3,11 @@ from __future__ import annotations
 from cryptography.fernet import Fernet
 
 from aws_light.models.secret import SecretSpec
-from aws_light.store.json_store import JsonStore
+from aws_light.store.base import AnyStore
 
 
 class SecretsManager:
-    def __init__(self, secret_store: JsonStore[SecretSpec]) -> None:
+    def __init__(self, secret_store: AnyStore[SecretSpec]) -> None:
         self._secret_store = secret_store
         self._fernet = _load_or_create_fernet()
 

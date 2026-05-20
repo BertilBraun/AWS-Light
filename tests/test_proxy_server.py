@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
+
 from aws_light.dashboard.event_bus import EventBus
 from aws_light.models.service import (
     InternalIngressPolicy,
@@ -10,11 +12,11 @@ from aws_light.models.service import (
     ServiceState,
 )
 from aws_light.proxy.proxy_server import (
+    _403_INTERNAL_RESPONSE,
+    _403_RESPONSE,
     _502_RESPONSE,
     _503_RESPONSE,
     _504_RESPONSE,
-    _403_INTERNAL_RESPONSE,
-    _403_RESPONSE,
     ProxyServer,
     UpstreamResponseError,
     _extract_request_content_length,
@@ -25,12 +27,14 @@ from aws_light.proxy.proxy_server import (
     _rewrite_request_headers,
     _rewrite_response_headers,
 )
+from aws_light.proxy.routing_table import ReplicaEndpoint
 
 
 class FakeRedis:
     def __init__(self) -> None:
         self.values: dict[str, int | str] = {}
         self.hashes: dict[str, dict[str, int]] = {}
+        self.pipeline_execute_count = 0
 
     def pipeline(self) -> FakePipeline:
         return FakePipeline(self)
@@ -44,6 +48,9 @@ class FakePipeline:
     def incr(self, key: str) -> None:
         self.commands.append(("incr", key, None, 1))
 
+    def incrby(self, key: str, amount: int) -> None:
+        self.commands.append(("incr", key, None, amount))
+
     def hincrby(self, key: str, field: str, amount: int) -> None:
         self.commands.append(("hincrby", key, field, amount))
 
@@ -51,6 +58,7 @@ class FakePipeline:
         self.commands.append(("set", key, None, value))
 
     async def execute(self) -> None:
+        self.redis.pipeline_execute_count += 1
         for command, key, field, value in self.commands:
             if command == "incr":
                 self.redis.values[key] = self.redis.values.get(key, 0) + int(value)
@@ -87,6 +95,58 @@ class FakeBalancer:
     async def healthy_replicas_for_request(self, service_name: str) -> list[object]:
         self.requested_services.append(service_name)
         raise AssertionError("Policy allowed request to reach load balancing")
+
+
+class StaticBalancer:
+    def __init__(self, endpoints: list[ReplicaEndpoint]) -> None:
+        self.endpoints = endpoints
+        self.requested_services: list[str] = []
+
+    async def healthy_replicas_for_request(self, service_name: str) -> list[ReplicaEndpoint]:
+        self.requested_services.append(service_name)
+        return self.endpoints
+
+
+class FakeHttpStream:
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> httpx.Response:
+        return self.response
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class FakeUpstreamHttpClient:
+    def __init__(self, outcomes: list[httpx.Response | Exception]) -> None:
+        self.outcomes = list(outcomes)
+        self.requests: list[dict[str, object]] = []
+        self.closed = False
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: list[tuple[str, str]],
+        content: bytes,
+    ) -> FakeHttpStream:
+        self.requests.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "content": content,
+            }
+        )
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return FakeHttpStream(outcome)
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class FakeWriter:
@@ -240,11 +300,12 @@ async def test_proxy_denies_external_request_when_service_not_exposed() -> None:
     assert balancer.requested_services == []
 
 
-async def test_proxy_forwards_platform_storage_path_before_ingress_policy(
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
+async def test_proxy_forwards_platform_storage_path_before_ingress_policy() -> None:
     service_store = FakeServiceStore({"proxy:8080": _service_state("proxy:8080")})
     balancer = FakeBalancer()
+    upstream_client = FakeUpstreamHttpClient(
+        [httpx.Response(200, headers={"Content-Length": "2"}, stream=httpx.ByteStream(b"{}"))]
+    )
     proxy = ProxyServer(
         balancer=balancer,  # type: ignore[arg-type]
         port=8080,
@@ -252,19 +313,9 @@ async def test_proxy_forwards_platform_storage_path_before_ingress_policy(
         secrets_manager=FakeSecretsManager(
             {"aws-light-service-token-combined-service": "combined-token"}
         ),  # type: ignore[arg-type]
+        upstream_http_client=upstream_client,  # type: ignore[arg-type]
     )
     writer = FakeWriter()
-    upstream_reader = _reader_with(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
-    )
-    upstream_writer = FakeUpstreamWriter()
-    upstream_connections: list[tuple[str, int]] = []
-
-    async def fake_open_connection(host: str, port: int):  # type: ignore[no-untyped-def]
-        upstream_connections.append((host, port))
-        return upstream_reader, upstream_writer
-
-    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
 
     await proxy._proxy_request(
         _reader_with(
@@ -276,9 +327,11 @@ async def test_proxy_forwards_platform_storage_path_before_ingress_policy(
         writer,  # type: ignore[arg-type]
     )
 
-    assert upstream_connections == [("control-plane", 8000)]
     assert b"HTTP/1.1 200 OK" in writer.data
-    assert b"Host: control-plane:8000\r\n" in upstream_writer.data
+    assert upstream_client.requests[0]["url"] == (
+        "http://control-plane:8000/_aws-light/storage/buckets/combined-objects/objects"
+    )
+    assert ("Host", "control-plane:8000") in upstream_client.requests[0]["headers"]
     assert balancer.requested_services == []
 
 
@@ -300,6 +353,89 @@ async def test_proxy_allows_external_request_when_service_is_exposed() -> None:
         pass
     else:
         raise AssertionError("Expected exposed service to reach load balancing")
+
+
+async def test_proxy_forwards_http_with_injected_upstream_client() -> None:
+    service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
+    upstream_client = FakeUpstreamHttpClient(
+        [
+            httpx.Response(
+                201,
+                headers={"Content-Type": "application/json", "Connection": "keep-alive"},
+                stream=httpx.ByteStream(b'{"ok": true}'),
+            )
+        ]
+    )
+    proxy = ProxyServer(
+        balancer=StaticBalancer(
+            [ReplicaEndpoint("replica-1", "10.0.0.5", 9000, healthy=True)]
+        ),  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+        upstream_http_client=upstream_client,  # type: ignore[arg-type]
+    )
+    writer = FakeWriter()
+
+    await proxy._proxy_request(
+        _reader_with(
+            b"POST /items?x=1 HTTP/1.1\r\n"
+            b"Host: public-api.localhost\r\n"
+            b"Connection: close\r\n"
+            b"Content-Length: 4\r\n"
+            b"\r\n"
+            b"body"
+        ),
+        writer,  # type: ignore[arg-type]
+    )
+
+    assert writer.data == (
+        b"HTTP/1.1 201 Created\r\n"
+        b"content-type: application/json\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b'{"ok": true}'
+    )
+    assert upstream_client.requests == [
+        {
+            "method": "POST",
+            "url": "http://10.0.0.5:9000/items?x=1",
+            "headers": [("Host", "10.0.0.5:9000"), ("Content-Length", "4")],
+            "content": b"body",
+        }
+    ]
+
+
+async def test_proxy_falls_back_to_next_http_replica_before_response_starts() -> None:
+    service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
+    upstream_client = FakeUpstreamHttpClient(
+        [
+            httpx.ConnectError("first replica failed"),
+            httpx.Response(200, headers={"Content-Length": "2"}, stream=httpx.ByteStream(b"ok")),
+        ]
+    )
+    proxy = ProxyServer(
+        balancer=StaticBalancer(
+            [
+                ReplicaEndpoint("replica-1", "10.0.0.5", 9000, healthy=True),
+                ReplicaEndpoint("replica-2", "10.0.0.6", 9001, healthy=True),
+            ]
+        ),  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+        upstream_http_client=upstream_client,  # type: ignore[arg-type]
+    )
+    writer = FakeWriter()
+
+    await proxy._proxy_request(
+        _reader_with(b"GET / HTTP/1.1\r\nHost: public-api.localhost\r\n\r\n"),
+        writer,  # type: ignore[arg-type]
+    )
+
+    assert b"HTTP/1.1 200 OK\r\n" in writer.data
+    assert [request["url"] for request in upstream_client.requests] == [
+        "http://10.0.0.5:9000/",
+        "http://10.0.0.6:9001/",
+    ]
 
 
 async def test_proxy_allows_internal_request_from_listed_caller() -> None:
@@ -424,7 +560,13 @@ async def test_record_proxy_result_writes_redis_metrics() -> None:
     await proxy._record_proxy_result("secret-service", 200, None, 12.3)
     await proxy._record_proxy_result("secret-service", 502, "upstream_unreachable", 4.0)
 
+    assert redis.values == {}
+    assert redis.hashes == {}
+
+    await proxy._flush_proxy_metrics()
+
     assert redis.values["proxy:requests:total"] == 2
+    assert redis.values["rps:secret-service"] == 2
     assert redis.values["proxy:last_duration_ms:secret-service"] == "4.00"
     assert redis.hashes["proxy:requests:service"] == {"secret-service": 2}
     assert redis.hashes["proxy:responses:status"] == {"200": 1, "502": 1}
@@ -437,6 +579,18 @@ async def test_record_proxy_result_writes_redis_metrics() -> None:
         values for key, values in redis.hashes.items() if key.startswith("proxy:ts:errors:")
     ]
     assert error_buckets == [{"secret-service": 1}]
+    assert redis.pipeline_execute_count == 1
+
+
+async def test_proxy_stop_flushes_pending_redis_metrics() -> None:
+    redis = FakeRedis()
+    proxy = ProxyServer(balancer=None, port=8080, redis_client=redis)  # type: ignore[arg-type]
+
+    await proxy._record_proxy_result("secret-service", 200, None, 12.3)
+    await proxy.stop()
+
+    assert redis.values["proxy:requests:total"] == 1
+    assert redis.values["rps:secret-service"] == 1
 
 
 async def test_record_proxy_result_publishes_failure_activity() -> None:
@@ -474,6 +628,7 @@ async def test_proxy_publishes_aggregated_traffic_activity() -> None:
 
     await proxy._record_proxy_result("secret-service", 200, None, 12.3)
     await proxy._record_proxy_result("secret-service", 502, "upstream_unreachable", 4.0)
+    await proxy._flush_proxy_metrics()
     await proxy._publish_traffic_activity()
 
     events = await event_bus.get_recent_events()

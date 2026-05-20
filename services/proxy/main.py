@@ -16,9 +16,13 @@ from aws_light.proxy.load_balancer import RoundRobinBalancer
 from aws_light.proxy.proxy_server import ProxyServer
 from aws_light.proxy.redis_routing_table import RedisRoutingTable
 from aws_light.secrets.secrets_manager import SecretsManager
+from aws_light.store.cached_store import TTLStoreCache
 from aws_light.store.postgres_store import PostgresStore
 
 logger = logging.getLogger(__name__)
+
+_PROXY_STORE_CACHE_TTL_SECONDS = 5.0
+_PROXY_STORE_CACHE_MAX_ENTRIES = 1024
 
 
 async def main() -> None:
@@ -30,16 +34,26 @@ async def main() -> None:
     routing_table = RedisRoutingTable(redis_client)
     service_store: PostgresStore[ServiceState] = PostgresStore(pool, "services", ServiceState)
     secret_store: PostgresStore[SecretSpec] = PostgresStore(pool, "secrets", SecretSpec)
-    for store in [service_store, secret_store]:
-        await store.create_table()
-    secrets_manager = SecretsManager(secret_store=secret_store)
+    await service_store.create_table()
+    await secret_store.create_table()
+    cached_service_store = TTLStoreCache(
+        service_store,
+        ttl_seconds=_PROXY_STORE_CACHE_TTL_SECONDS,
+        max_entries=_PROXY_STORE_CACHE_MAX_ENTRIES,
+    )
+    cached_secret_store = TTLStoreCache(
+        secret_store,
+        ttl_seconds=_PROXY_STORE_CACHE_TTL_SECONDS,
+        max_entries=_PROXY_STORE_CACHE_MAX_ENTRIES,
+    )
+    secrets_manager = SecretsManager(secret_store=cached_secret_store)
     balancer = RoundRobinBalancer(routing_table)
     proxy = ProxyServer(
         balancer=balancer,
         port=settings.proxy_port,
         redis_client=redis_client,
-        event_bus=event_bus,
-        service_store=service_store,
+        event_bus=event_bus,  # type: ignore[arg-type]
+        service_store=cached_service_store,
         secrets_manager=secrets_manager,
     )
 

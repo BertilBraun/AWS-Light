@@ -4,10 +4,13 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import TYPE_CHECKING
 
+import httpx
+
 from aws_light.proxy.load_balancer import NoHealthyReplicaError, RoundRobinBalancer
+from aws_light.proxy.routing_table import ReplicaEndpoint
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
@@ -81,6 +84,7 @@ _PROXY_METRIC_BY_STATUS = "proxy:responses:status"
 _PROXY_METRIC_FAILURES = "proxy:failures"
 _PROXY_TIMESERIES_BUCKET_SECONDS = 10
 _PROXY_ACTIVITY_INTERVAL_SECONDS = 10.0
+_PROXY_METRIC_FLUSH_INTERVAL_SECONDS = 1.0
 _SERVICE_TOKEN_HEADER = b"x-aws-light-service-token"
 _SERVICE_TOKEN_SECRET_PREFIX = "aws-light-service-token-"
 _PLATFORM_STORAGE_PREFIX = "/_aws-light/storage"
@@ -93,10 +97,11 @@ class ProxyServer:
         self,
         balancer: RoundRobinBalancer,
         port: int,
-        redis_client: Redis | None = None,  # type: ignore[type-arg]
+        redis_client: Redis | None = None,
         event_bus: EventBus | None = None,
         service_store: AnyStore[ServiceState] | None = None,
         secrets_manager: SecretsManager | None = None,
+        upstream_http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._balancer = balancer
         self._port = port
@@ -104,28 +109,55 @@ class ProxyServer:
         self._event_bus = event_bus
         self._service_store = service_store
         self._secrets_manager = secrets_manager
+        self._upstream_http_client = upstream_http_client or httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=1000, max_keepalive_connections=200),
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0),
+        )
+        self._owns_upstream_http_client = upstream_http_client is None
         self._server: asyncio.AbstractServer | None = None
         self._activity_task: asyncio.Task[None] | None = None
+        self._metric_flush_task: asyncio.Task[None] | None = None
         self._traffic_lock = asyncio.Lock()
         self._traffic_total = 0
         self._traffic_by_service: Counter[str] = Counter()
         self._traffic_by_status: Counter[int] = Counter()
         self._traffic_failures: Counter[str] = Counter()
+        self._metrics_lock = asyncio.Lock()
+        self._metric_total = 0
+        self._metric_by_service: Counter[str] = Counter()
+        self._metric_by_status: Counter[int] = Counter()
+        self._metric_failures: Counter[str] = Counter()
+        self._metric_last_duration_ms: dict[str, float] = {}
+        self._metric_rps: Counter[str] = Counter()
+        self._metric_ts_requests: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._metric_ts_status: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._metric_ts_latency_sum: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._metric_ts_latency_count: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._metric_ts_errors: defaultdict[int, Counter[str]] = defaultdict(Counter)
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_connection, "0.0.0.0", self._port)
         if self._event_bus is not None:
             self._activity_task = asyncio.create_task(self._traffic_activity_loop())
+        if self._redis is not None:
+            self._metric_flush_task = asyncio.create_task(self._metric_flush_loop())
         logger.info("Proxy server listening on port %d", self._port)
 
     async def stop(self) -> None:
+        if self._metric_flush_task is not None:
+            self._metric_flush_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._metric_flush_task
         if self._activity_task is not None:
             self._activity_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._activity_task
+        await self._flush_proxy_metrics()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
+        if self._owns_upstream_http_client:
+            await self._upstream_http_client.aclose()
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -217,8 +249,16 @@ class ProxyServer:
             await self._record_proxy_result(service_name, 503, "no_healthy_replica", 0.0)
             return
 
-        if self._redis is not None:
-            await self._redis.incr(f"rps:{service_name}")
+        is_websocket = _is_websocket_upgrade(header_bytes)
+        if not is_websocket:
+            await self._forward_http_to_candidates(
+                header_bytes,
+                body,
+                writer,
+                endpoints,
+                service_name,
+            )
+            return
 
         started = time.perf_counter()
         upstream_reader: asyncio.StreamReader | None = None
@@ -256,55 +296,17 @@ class ProxyServer:
             await self._record_proxy_result(service_name, 502, "upstream_unreachable", duration_ms)
             return
 
-        is_websocket = _is_websocket_upgrade(header_bytes)
         rewritten_headers = _rewrite_request_headers(header_bytes, endpoint.host, endpoint.port)
         upstream_writer.write(rewritten_headers)
-        if not is_websocket and body:
+        if body:
             upstream_writer.write(body)
         await upstream_writer.drain()
 
-        if is_websocket:
-            await asyncio.gather(
-                _pipe_stream(reader, upstream_writer),
-                _pipe_stream(upstream_reader, writer),
-                return_exceptions=True,
-            )
-        else:
-            try:
-                upstream_response = await _read_full_response(upstream_reader)
-            except UpstreamResponseTimeout:
-                writer.write(_504_RESPONSE)
-                await writer.drain()
-                upstream_writer.close()
-                await upstream_writer.wait_closed()
-                duration_ms = (time.perf_counter() - started) * 1000
-                logger.warning(
-                    "Proxy timed out waiting for %s replica %s response after %.2fms",
-                    service_name,
-                    endpoint.replica_id[:8],
-                    duration_ms,
-                )
-                await self._record_proxy_result(
-                    service_name, 504, "upstream_response_timeout", duration_ms
-                )
-                return
-            except UpstreamResponseError:
-                writer.write(_502_RESPONSE)
-                await writer.drain()
-                upstream_writer.close()
-                await upstream_writer.wait_closed()
-                duration_ms = (time.perf_counter() - started) * 1000
-                await self._record_proxy_result(
-                    service_name, 502, "upstream_invalid_response", duration_ms
-                )
-                return
-            status_code = _extract_response_status(upstream_response) or 502
-            writer.write(upstream_response)
-            await writer.drain()
-            upstream_writer.close()
-            await upstream_writer.wait_closed()
-            duration_ms = (time.perf_counter() - started) * 1000
-            await self._record_proxy_result(service_name, status_code, None, duration_ms)
+        await asyncio.gather(
+            _pipe_stream(reader, upstream_writer),
+            _pipe_stream(upstream_reader, writer),
+            return_exceptions=True,
+        )
 
     async def _forward_to_upstream(
         self,
@@ -315,62 +317,110 @@ class ProxyServer:
         upstream_port: int,
         metric_service: str,
     ) -> None:
+        await self._forward_http_to_candidates(
+            header_bytes,
+            body,
+            writer,
+            [ReplicaEndpoint(metric_service, upstream_host, upstream_port, healthy=True)],
+            metric_service,
+        )
+
+    async def _forward_http_to_candidates(
+        self,
+        header_bytes: bytes,
+        body: bytes,
+        writer: asyncio.StreamWriter,
+        endpoints: list[ReplicaEndpoint],
+        metric_service: str,
+    ) -> None:
         started = time.perf_counter()
-        try:
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(upstream_host, upstream_port), timeout=5.0
-            )
-        except (OSError, asyncio.TimeoutError) as error:
-            writer.write(_502_RESPONSE)
-            await writer.drain()
+        failures: list[str] = []
+        timeout_seen = False
+        for endpoint in endpoints:
+            try:
+                status_code = await self._forward_http_to_endpoint(
+                    header_bytes,
+                    body,
+                    writer,
+                    endpoint,
+                )
+            except httpx.TimeoutException as error:
+                timeout_seen = True
+                failures.append(f"{endpoint.replica_id[:8]} {endpoint.host}:{endpoint.port}")
+                logger.warning(
+                    "Proxy timed out waiting for %s replica %s at %s:%d: %s",
+                    metric_service,
+                    endpoint.replica_id[:8],
+                    endpoint.host,
+                    endpoint.port,
+                    error,
+                )
+                continue
+            except UpstreamStreamInterrupted as error:
+                duration_ms = (time.perf_counter() - started) * 1000
+                await self._record_proxy_result(
+                    metric_service,
+                    error.status_code,
+                    "upstream_stream_interrupted",
+                    duration_ms,
+                )
+                return
+            except httpx.HTTPError as error:
+                failures.append(f"{endpoint.replica_id[:8]} {endpoint.host}:{endpoint.port}")
+                logger.warning(
+                    "Proxy could not reach %s replica %s at %s:%d: %s",
+                    metric_service,
+                    endpoint.replica_id[:8],
+                    endpoint.host,
+                    endpoint.port,
+                    error,
+                )
+                continue
             duration_ms = (time.perf_counter() - started) * 1000
-            logger.warning(
-                "Proxy could not connect to platform upstream %s:%d: %s",
-                upstream_host,
-                upstream_port,
-                error,
-            )
-            await self._record_proxy_result(
-                metric_service, 502, "upstream_unreachable", duration_ms
-            )
+            await self._record_proxy_result(metric_service, status_code, None, duration_ms)
             return
 
-        rewritten_headers = _rewrite_request_headers(header_bytes, upstream_host, upstream_port)
-        upstream_writer.write(rewritten_headers)
-        if body:
-            upstream_writer.write(body)
-        await upstream_writer.drain()
-
-        try:
-            upstream_response = await _read_full_response(upstream_reader)
-        except UpstreamResponseTimeout:
-            writer.write(_504_RESPONSE)
-            await writer.drain()
-            upstream_writer.close()
-            await upstream_writer.wait_closed()
-            duration_ms = (time.perf_counter() - started) * 1000
-            await self._record_proxy_result(
-                metric_service, 504, "upstream_response_timeout", duration_ms
-            )
-            return
-        except UpstreamResponseError:
-            writer.write(_502_RESPONSE)
-            await writer.drain()
-            upstream_writer.close()
-            await upstream_writer.wait_closed()
-            duration_ms = (time.perf_counter() - started) * 1000
-            await self._record_proxy_result(
-                metric_service, 502, "upstream_invalid_response", duration_ms
-            )
-            return
-
-        status_code = _extract_response_status(upstream_response) or 502
-        writer.write(upstream_response)
+        status_code = 504 if timeout_seen else 502
+        failure_reason = "upstream_response_timeout" if timeout_seen else "upstream_unreachable"
+        writer.write(_504_RESPONSE if timeout_seen else _502_RESPONSE)
         await writer.drain()
-        upstream_writer.close()
-        await upstream_writer.wait_closed()
         duration_ms = (time.perf_counter() - started) * 1000
-        await self._record_proxy_result(metric_service, status_code, None, duration_ms)
+        logger.warning(
+            "Proxy returning %d for %s after %d failed upstream HTTP attempts: %s",
+            status_code,
+            metric_service,
+            len(failures),
+            ", ".join(failures) or "none",
+        )
+        await self._record_proxy_result(metric_service, status_code, failure_reason, duration_ms)
+
+    async def _forward_http_to_endpoint(
+        self,
+        header_bytes: bytes,
+        body: bytes,
+        writer: asyncio.StreamWriter,
+        endpoint: ReplicaEndpoint,
+    ) -> int:
+        method, target = _extract_request_method_and_target(header_bytes)
+        url = f"http://{endpoint.host}:{endpoint.port}{target}"
+        headers = _httpx_request_headers(header_bytes, endpoint.host, endpoint.port)
+        async with self._upstream_http_client.stream(
+            method,
+            url,
+            headers=headers,
+            content=body,
+        ) as response:
+            writer.write(_httpx_response_head(response))
+            await writer.drain()
+            try:
+                async for chunk in response.aiter_raw():
+                    if not chunk:
+                        continue
+                    writer.write(chunk)
+                    await writer.drain()
+            except httpx.HTTPError as exc:
+                raise UpstreamStreamInterrupted(response.status_code) from exc
+            return response.status_code
 
     async def _external_ingress_allowed(self, service_name: str) -> bool:
         if self._service_store is None:
@@ -401,7 +451,10 @@ class ProxyServer:
             if stored_token != token:
                 continue
             service_name = secret_name.removeprefix(_SERVICE_TOKEN_SECRET_PREFIX)
-            if self._service_store is not None and await self._service_store.get(service_name) is None:
+            if (
+                self._service_store is not None
+                and await self._service_store.get(service_name) is None
+            ):
                 return None
             return service_name
         return None
@@ -416,25 +469,25 @@ class ProxyServer:
         if self._redis is None:
             return
 
-        pipe = self._redis.pipeline()
-        pipe.incr(_PROXY_METRIC_TOTAL)
-        pipe.hincrby(_PROXY_METRIC_BY_STATUS, str(status_code), 1)
-        if service_name:
-            pipe.hincrby(_PROXY_METRIC_BY_SERVICE, service_name, 1)
-            pipe.set(f"proxy:last_duration_ms:{service_name}", f"{duration_ms:.2f}")
         bucket = (
             int(time.time() // _PROXY_TIMESERIES_BUCKET_SECONDS) * _PROXY_TIMESERIES_BUCKET_SECONDS
         )
         timeseries_service = service_name or "__unknown__"
-        pipe.hincrby(f"proxy:ts:requests:{bucket}", timeseries_service, 1)
-        pipe.hincrby(f"proxy:ts:status:{bucket}", str(status_code), 1)
-        pipe.hincrby(f"proxy:ts:latency_sum:{bucket}", timeseries_service, int(duration_ms * 100))
-        pipe.hincrby(f"proxy:ts:latency_count:{bucket}", timeseries_service, 1)
-        if status_code >= 500:
-            pipe.hincrby(f"proxy:ts:errors:{bucket}", timeseries_service, 1)
-        if failure_reason:
-            pipe.hincrby(_PROXY_METRIC_FAILURES, failure_reason, 1)
-        await pipe.execute()
+        async with self._metrics_lock:
+            self._metric_total += 1
+            self._metric_by_status[status_code] += 1
+            if service_name:
+                self._metric_by_service[service_name] += 1
+                self._metric_last_duration_ms[service_name] = duration_ms
+                self._metric_rps[service_name] += 1
+            self._metric_ts_requests[bucket][timeseries_service] += 1
+            self._metric_ts_status[bucket][str(status_code)] += 1
+            self._metric_ts_latency_sum[bucket][timeseries_service] += int(duration_ms * 100)
+            self._metric_ts_latency_count[bucket][timeseries_service] += 1
+            if status_code >= 500:
+                self._metric_ts_errors[bucket][timeseries_service] += 1
+            if failure_reason:
+                self._metric_failures[failure_reason] += 1
         await self._record_traffic_activity(service_name, status_code, failure_reason)
         if failure_reason and self._event_bus is not None:
             await self._event_bus.publish(
@@ -448,6 +501,79 @@ class ProxyServer:
                     },
                 )
             )
+
+    async def _metric_flush_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_PROXY_METRIC_FLUSH_INTERVAL_SECONDS)
+            await self._flush_proxy_metrics()
+
+    async def _flush_proxy_metrics(self) -> None:
+        if self._redis is None:
+            return
+        async with self._metrics_lock:
+            total = self._metric_total
+            by_service = Counter(self._metric_by_service)
+            by_status = Counter(self._metric_by_status)
+            failures = Counter(self._metric_failures)
+            last_duration_ms = dict(self._metric_last_duration_ms)
+            rps = Counter(self._metric_rps)
+            ts_requests = {
+                bucket: Counter(values) for bucket, values in self._metric_ts_requests.items()
+            }
+            ts_status = {
+                bucket: Counter(values) for bucket, values in self._metric_ts_status.items()
+            }
+            ts_latency_sum = {
+                bucket: Counter(values) for bucket, values in self._metric_ts_latency_sum.items()
+            }
+            ts_latency_count = {
+                bucket: Counter(values) for bucket, values in self._metric_ts_latency_count.items()
+            }
+            ts_errors = {
+                bucket: Counter(values) for bucket, values in self._metric_ts_errors.items()
+            }
+            self._metric_total = 0
+            self._metric_by_service.clear()
+            self._metric_by_status.clear()
+            self._metric_failures.clear()
+            self._metric_last_duration_ms.clear()
+            self._metric_rps.clear()
+            self._metric_ts_requests.clear()
+            self._metric_ts_status.clear()
+            self._metric_ts_latency_sum.clear()
+            self._metric_ts_latency_count.clear()
+            self._metric_ts_errors.clear()
+        if total == 0:
+            return
+
+        pipe = self._redis.pipeline()
+        pipe.incrby(_PROXY_METRIC_TOTAL, total)
+        for service, count in rps.items():
+            pipe.incrby(f"rps:{service}", count)
+        for status_code, count in by_status.items():
+            pipe.hincrby(_PROXY_METRIC_BY_STATUS, str(status_code), count)
+        for service, count in by_service.items():
+            pipe.hincrby(_PROXY_METRIC_BY_SERVICE, service, count)
+        for service, duration_ms in last_duration_ms.items():
+            pipe.set(f"proxy:last_duration_ms:{service}", f"{duration_ms:.2f}")
+        for bucket, values in ts_requests.items():
+            for service, count in values.items():
+                pipe.hincrby(f"proxy:ts:requests:{bucket}", service, count)
+        for bucket, values in ts_status.items():
+            for status_field, count in values.items():
+                pipe.hincrby(f"proxy:ts:status:{bucket}", status_field, count)
+        for bucket, values in ts_latency_sum.items():
+            for service, amount in values.items():
+                pipe.hincrby(f"proxy:ts:latency_sum:{bucket}", service, amount)
+        for bucket, values in ts_latency_count.items():
+            for service, count in values.items():
+                pipe.hincrby(f"proxy:ts:latency_count:{bucket}", service, count)
+        for bucket, values in ts_errors.items():
+            for service, count in values.items():
+                pipe.hincrby(f"proxy:ts:errors:{bucket}", service, count)
+        for failure_reason, count in failures.items():
+            pipe.hincrby(_PROXY_METRIC_FAILURES, failure_reason, count)
+        await pipe.execute()
 
     async def _record_traffic_activity(
         self,
@@ -543,6 +669,18 @@ def _extract_request_path(header_bytes: bytes) -> str:
     return parts[1].decode(errors="replace")
 
 
+def _extract_request_method_and_target(header_bytes: bytes) -> tuple[str, str]:
+    request_line = header_bytes.split(b"\r\n", 1)[0]
+    parts = request_line.split()
+    if len(parts) < 2:
+        return "GET", "/"
+    method = parts[0].decode(errors="replace")
+    target = parts[1].decode(errors="replace") or "/"
+    if not target.startswith("/"):
+        target = "/"
+    return method, target
+
+
 def _is_websocket_upgrade(header_bytes: bytes) -> bool:
     return b"upgrade: websocket" in header_bytes.lower()
 
@@ -588,6 +726,42 @@ def _rewrite_response_headers(header_bytes: bytes) -> bytes:
     return b"\r\n".join(rewritten) + _HEADER_DELIMITER
 
 
+def _httpx_request_headers(
+    header_bytes: bytes,
+    upstream_host: str,
+    upstream_port: int,
+) -> list[tuple[str, str]]:
+    lines = _header_lines(header_bytes)
+    if not lines:
+        return []
+
+    headers = [("Host", f"{upstream_host}:{upstream_port}")]
+    for line in lines[1:]:
+        name = _header_name(line)
+        if name is None or name in _HOP_BY_HOP_HEADERS or name == b"host":
+            continue
+        raw_name, raw_value = line.split(b":", 1)
+        headers.append(
+            (
+                raw_name.decode(errors="replace"),
+                raw_value.strip().decode(errors="replace"),
+            )
+        )
+    return headers
+
+
+def _httpx_response_head(response: httpx.Response) -> bytes:
+    reason = response.reason_phrase or ""
+    lines = [f"HTTP/1.1 {response.status_code} {reason}".rstrip().encode()]
+    for name, value in response.headers.multi_items():
+        header_name = name.encode().lower()
+        if header_name in _HOP_BY_HOP_HEADERS:
+            continue
+        lines.append(f"{name}: {value}".encode())
+    lines.append(b"Connection: close")
+    return b"\r\n".join(lines) + _HEADER_DELIMITER
+
+
 async def _pipe_stream(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
     try:
         while True:
@@ -608,6 +782,12 @@ class UpstreamResponseError(Exception):
 
 class UpstreamResponseTimeout(UpstreamResponseError):
     pass
+
+
+class UpstreamStreamInterrupted(UpstreamResponseError):
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"upstream stream interrupted after {status_code} response started")
 
 
 async def _read_full_response(reader: asyncio.StreamReader) -> bytes:
