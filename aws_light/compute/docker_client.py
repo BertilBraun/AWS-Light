@@ -111,7 +111,7 @@ class DockerClient:
             mem_limit=f"{memory_mb}m",
             network=network,
             labels=labels,
-            volumes=volumes,
+            volumes=_format_volume_bindings(volumes),
             remove=False,
         )
         container_ip = self._poll_container_ip(container, network)
@@ -264,3 +264,17 @@ def _format_ports(raw_ports: dict) -> list[str]:  # type: ignore[type-arg]
             host_port = binding.get("HostPort", "")
             formatted.append(f"{host_ip}:{host_port}->{container_port}")
     return formatted
+
+
+def _format_volume_bindings(
+    volumes: dict[str, str] | None,
+) -> dict[str, dict[str, str]] | None:
+    if volumes is None:
+        return None
+    return {
+        volume_name: {
+            "bind": mount_path,
+            "mode": "rw",
+        }
+        for volume_name, mount_path in volumes.items()
+    }
