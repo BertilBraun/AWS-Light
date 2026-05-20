@@ -5,6 +5,7 @@ import contextlib
 import logging
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from aws_light.proxy.load_balancer import NoHealthyReplicaError, RoundRobinBalancer
@@ -88,6 +89,50 @@ _SERVICE_TOKEN_SECRET_PREFIX = "aws-light-service-token-"
 _PLATFORM_STORAGE_PREFIX = "/_aws-light/storage"
 _CONTROL_PLANE_HOST = "control-plane"
 _CONTROL_PLANE_PORT = 8000
+
+
+@dataclass(frozen=True)
+class _TrafficSnapshot:
+    total: int
+    by_service: dict[str, int]
+    by_status: dict[str, int]
+    failures: dict[str, int]
+
+
+class _ProxyTrafficActivity:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._total = 0
+        self._by_service: Counter[str] = Counter()
+        self._by_status: Counter[int] = Counter()
+        self._failures: Counter[str] = Counter()
+
+    async def record(
+        self,
+        service_name: str | None,
+        status_code: int,
+        failure_reason: str | None,
+    ) -> None:
+        async with self._lock:
+            self._total += 1
+            self._by_service[service_name or "__unknown__"] += 1
+            self._by_status[status_code] += 1
+            if failure_reason:
+                self._failures[failure_reason] += 1
+
+    async def snapshot(self) -> _TrafficSnapshot:
+        async with self._lock:
+            snapshot = _TrafficSnapshot(
+                total=self._total,
+                by_service=dict(self._by_service),
+                by_status={str(status): count for status, count in self._by_status.items()},
+                failures=dict(self._failures),
+            )
+            self._total = 0
+            self._by_service.clear()
+            self._by_status.clear()
+            self._failures.clear()
+        return snapshot
 
 
 class _ProxyMetrics:
@@ -221,11 +266,7 @@ class ProxyServer:
         self._server: asyncio.AbstractServer | None = None
         self._activity_task: asyncio.Task[None] | None = None
         self._metric_flush_task: asyncio.Task[None] | None = None
-        self._traffic_lock = asyncio.Lock()
-        self._traffic_total = 0
-        self._traffic_by_service: Counter[str] = Counter()
-        self._traffic_by_status: Counter[int] = Counter()
-        self._traffic_failures: Counter[str] = Counter()
+        self._traffic = _ProxyTrafficActivity()
         self._metrics = _ProxyMetrics()
 
     async def start(self) -> None:
@@ -582,12 +623,7 @@ class ProxyServer:
         status_code: int,
         failure_reason: str | None,
     ) -> None:
-        async with self._traffic_lock:
-            self._traffic_total += 1
-            self._traffic_by_service[service_name or "__unknown__"] += 1
-            self._traffic_by_status[status_code] += 1
-            if failure_reason:
-                self._traffic_failures[failure_reason] += 1
+        await self._traffic.record(service_name, status_code, failure_reason)
 
     async def _traffic_activity_loop(self) -> None:
         while True:
@@ -597,23 +633,15 @@ class ProxyServer:
     async def _publish_traffic_activity(self) -> None:
         if self._event_bus is None:
             return
-        async with self._traffic_lock:
-            total = self._traffic_total
-            by_service = dict(self._traffic_by_service)
-            by_status = {str(status): count for status, count in self._traffic_by_status.items()}
-            failures = dict(self._traffic_failures)
-            self._traffic_total = 0
-            self._traffic_by_service.clear()
-            self._traffic_by_status.clear()
-            self._traffic_failures.clear()
-        if total == 0:
+        snapshot = await self._traffic.snapshot()
+        if snapshot.total == 0:
             return
         error_count = sum(
-            count for status, count in by_status.items() if int(status) >= 500
+            count for status, count in snapshot.by_status.items() if int(status) >= 500
         )
         logger.info(
             "Proxy handled %d requests in %.0fs (%d errors)",
-            total,
+            snapshot.total,
             _PROXY_ACTIVITY_INTERVAL_SECONDS,
             error_count,
         )
@@ -623,11 +651,11 @@ class ProxyServer:
                 payload={
                     "component": "proxy",
                     "window_seconds": int(_PROXY_ACTIVITY_INTERVAL_SECONDS),
-                    "requests_total": total,
+                    "requests_total": snapshot.total,
                     "errors_total": error_count,
-                    "requests_by_service": by_service,
-                    "responses_by_status": by_status,
-                    "failures": failures,
+                    "requests_by_service": snapshot.by_service,
+                    "responses_by_status": snapshot.by_status,
+                    "failures": snapshot.failures,
                 },
             )
         )
