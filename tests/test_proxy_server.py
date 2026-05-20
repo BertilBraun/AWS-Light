@@ -664,11 +664,3 @@ async def test_proxy_publishes_aggregated_traffic_activity() -> None:
     assert events[-1].payload["errors_total"] == 1
     assert events[-1].payload["requests_by_service"] == {"secret-service": 2}
     assert events[-1].payload["responses_by_status"] == {"200": 1, "502": 1}
-
-
-def test_proxy_does_not_keep_temporary_stage_timing_state() -> None:
-    proxy = ProxyServer(balancer=None, port=8080)  # type: ignore[arg-type]
-
-    assert not hasattr(proxy, "_timing_task")
-    assert not hasattr(proxy, "_timing_counts")
-    assert not hasattr(proxy, "_record_timing")

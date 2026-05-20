@@ -90,6 +90,118 @@ _CONTROL_PLANE_HOST = "control-plane"
 _CONTROL_PLANE_PORT = 8000
 
 
+class _ProxyMetrics:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._total = 0
+        self._by_service: Counter[str] = Counter()
+        self._by_status: Counter[int] = Counter()
+        self._failures: Counter[str] = Counter()
+        self._last_duration_ms: dict[str, float] = {}
+        self._rps: Counter[str] = Counter()
+        self._ts_requests: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._ts_status: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._ts_latency_sum: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._ts_latency_count: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._ts_errors: defaultdict[int, Counter[str]] = defaultdict(Counter)
+
+    async def record(
+        self,
+        service_name: str | None,
+        status_code: int,
+        failure_reason: str | None,
+        duration_ms: float,
+    ) -> None:
+        bucket = (
+            int(time.time() // _PROXY_TIMESERIES_BUCKET_SECONDS) * _PROXY_TIMESERIES_BUCKET_SECONDS
+        )
+        timeseries_service = service_name or "__unknown__"
+        async with self._lock:
+            self._total += 1
+            self._by_status[status_code] += 1
+            if service_name:
+                self._by_service[service_name] += 1
+                self._last_duration_ms[service_name] = duration_ms
+                self._rps[service_name] += 1
+            self._ts_requests[bucket][timeseries_service] += 1
+            self._ts_status[bucket][str(status_code)] += 1
+            self._ts_latency_sum[bucket][timeseries_service] += int(duration_ms * 100)
+            self._ts_latency_count[bucket][timeseries_service] += 1
+            if status_code >= 500:
+                self._ts_errors[bucket][timeseries_service] += 1
+            if failure_reason:
+                self._failures[failure_reason] += 1
+
+    async def flush_to(self, redis: Redis) -> None:
+        async with self._lock:
+            total = self._total
+            by_service = Counter(self._by_service)
+            by_status = Counter(self._by_status)
+            failures = Counter(self._failures)
+            last_duration_ms = dict(self._last_duration_ms)
+            rps = Counter(self._rps)
+            ts_requests = {
+                bucket: Counter(values) for bucket, values in self._ts_requests.items()
+            }
+            ts_status = {
+                bucket: Counter(values) for bucket, values in self._ts_status.items()
+            }
+            ts_latency_sum = {
+                bucket: Counter(values) for bucket, values in self._ts_latency_sum.items()
+            }
+            ts_latency_count = {
+                bucket: Counter(values) for bucket, values in self._ts_latency_count.items()
+            }
+            ts_errors = {
+                bucket: Counter(values) for bucket, values in self._ts_errors.items()
+            }
+            self._clear()
+        if total == 0:
+            return
+
+        pipe = redis.pipeline()
+        pipe.incrby(_PROXY_METRIC_TOTAL, total)
+        for service, count in rps.items():
+            pipe.incrby(f"rps:{service}", count)
+        for status_code, count in by_status.items():
+            pipe.hincrby(_PROXY_METRIC_BY_STATUS, str(status_code), count)
+        for service, count in by_service.items():
+            pipe.hincrby(_PROXY_METRIC_BY_SERVICE, service, count)
+        for service, duration_ms in last_duration_ms.items():
+            pipe.set(f"proxy:last_duration_ms:{service}", f"{duration_ms:.2f}")
+        for bucket, values in ts_requests.items():
+            for service, count in values.items():
+                pipe.hincrby(f"proxy:ts:requests:{bucket}", service, count)
+        for bucket, values in ts_status.items():
+            for status_field, count in values.items():
+                pipe.hincrby(f"proxy:ts:status:{bucket}", status_field, count)
+        for bucket, values in ts_latency_sum.items():
+            for service, amount in values.items():
+                pipe.hincrby(f"proxy:ts:latency_sum:{bucket}", service, amount)
+        for bucket, values in ts_latency_count.items():
+            for service, count in values.items():
+                pipe.hincrby(f"proxy:ts:latency_count:{bucket}", service, count)
+        for bucket, values in ts_errors.items():
+            for service, count in values.items():
+                pipe.hincrby(f"proxy:ts:errors:{bucket}", service, count)
+        for failure_reason, count in failures.items():
+            pipe.hincrby(_PROXY_METRIC_FAILURES, failure_reason, count)
+        await pipe.execute()
+
+    def _clear(self) -> None:
+        self._total = 0
+        self._by_service.clear()
+        self._by_status.clear()
+        self._failures.clear()
+        self._last_duration_ms.clear()
+        self._rps.clear()
+        self._ts_requests.clear()
+        self._ts_status.clear()
+        self._ts_latency_sum.clear()
+        self._ts_latency_count.clear()
+        self._ts_errors.clear()
+
+
 class ProxyServer:
     def __init__(
         self,
@@ -114,18 +226,7 @@ class ProxyServer:
         self._traffic_by_service: Counter[str] = Counter()
         self._traffic_by_status: Counter[int] = Counter()
         self._traffic_failures: Counter[str] = Counter()
-        self._metrics_lock = asyncio.Lock()
-        self._metric_total = 0
-        self._metric_by_service: Counter[str] = Counter()
-        self._metric_by_status: Counter[int] = Counter()
-        self._metric_failures: Counter[str] = Counter()
-        self._metric_last_duration_ms: dict[str, float] = {}
-        self._metric_rps: Counter[str] = Counter()
-        self._metric_ts_requests: defaultdict[int, Counter[str]] = defaultdict(Counter)
-        self._metric_ts_status: defaultdict[int, Counter[str]] = defaultdict(Counter)
-        self._metric_ts_latency_sum: defaultdict[int, Counter[str]] = defaultdict(Counter)
-        self._metric_ts_latency_count: defaultdict[int, Counter[str]] = defaultdict(Counter)
-        self._metric_ts_errors: defaultdict[int, Counter[str]] = defaultdict(Counter)
+        self._metrics = _ProxyMetrics()
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_connection, "0.0.0.0", self._port)
@@ -450,25 +551,7 @@ class ProxyServer:
         if self._redis is None:
             return
 
-        bucket = (
-            int(time.time() // _PROXY_TIMESERIES_BUCKET_SECONDS) * _PROXY_TIMESERIES_BUCKET_SECONDS
-        )
-        timeseries_service = service_name or "__unknown__"
-        async with self._metrics_lock:
-            self._metric_total += 1
-            self._metric_by_status[status_code] += 1
-            if service_name:
-                self._metric_by_service[service_name] += 1
-                self._metric_last_duration_ms[service_name] = duration_ms
-                self._metric_rps[service_name] += 1
-            self._metric_ts_requests[bucket][timeseries_service] += 1
-            self._metric_ts_status[bucket][str(status_code)] += 1
-            self._metric_ts_latency_sum[bucket][timeseries_service] += int(duration_ms * 100)
-            self._metric_ts_latency_count[bucket][timeseries_service] += 1
-            if status_code >= 500:
-                self._metric_ts_errors[bucket][timeseries_service] += 1
-            if failure_reason:
-                self._metric_failures[failure_reason] += 1
+        await self._metrics.record(service_name, status_code, failure_reason, duration_ms)
         await self._record_traffic_activity(service_name, status_code, failure_reason)
         if failure_reason and self._event_bus is not None:
             await self._event_bus.publish(
@@ -491,70 +574,7 @@ class ProxyServer:
     async def _flush_proxy_metrics(self) -> None:
         if self._redis is None:
             return
-        async with self._metrics_lock:
-            total = self._metric_total
-            by_service = Counter(self._metric_by_service)
-            by_status = Counter(self._metric_by_status)
-            failures = Counter(self._metric_failures)
-            last_duration_ms = dict(self._metric_last_duration_ms)
-            rps = Counter(self._metric_rps)
-            ts_requests = {
-                bucket: Counter(values) for bucket, values in self._metric_ts_requests.items()
-            }
-            ts_status = {
-                bucket: Counter(values) for bucket, values in self._metric_ts_status.items()
-            }
-            ts_latency_sum = {
-                bucket: Counter(values) for bucket, values in self._metric_ts_latency_sum.items()
-            }
-            ts_latency_count = {
-                bucket: Counter(values) for bucket, values in self._metric_ts_latency_count.items()
-            }
-            ts_errors = {
-                bucket: Counter(values) for bucket, values in self._metric_ts_errors.items()
-            }
-            self._metric_total = 0
-            self._metric_by_service.clear()
-            self._metric_by_status.clear()
-            self._metric_failures.clear()
-            self._metric_last_duration_ms.clear()
-            self._metric_rps.clear()
-            self._metric_ts_requests.clear()
-            self._metric_ts_status.clear()
-            self._metric_ts_latency_sum.clear()
-            self._metric_ts_latency_count.clear()
-            self._metric_ts_errors.clear()
-        if total == 0:
-            return
-
-        pipe = self._redis.pipeline()
-        pipe.incrby(_PROXY_METRIC_TOTAL, total)
-        for service, count in rps.items():
-            pipe.incrby(f"rps:{service}", count)
-        for status_code, count in by_status.items():
-            pipe.hincrby(_PROXY_METRIC_BY_STATUS, str(status_code), count)
-        for service, count in by_service.items():
-            pipe.hincrby(_PROXY_METRIC_BY_SERVICE, service, count)
-        for service, duration_ms in last_duration_ms.items():
-            pipe.set(f"proxy:last_duration_ms:{service}", f"{duration_ms:.2f}")
-        for bucket, values in ts_requests.items():
-            for service, count in values.items():
-                pipe.hincrby(f"proxy:ts:requests:{bucket}", service, count)
-        for bucket, values in ts_status.items():
-            for status_field, count in values.items():
-                pipe.hincrby(f"proxy:ts:status:{bucket}", status_field, count)
-        for bucket, values in ts_latency_sum.items():
-            for service, amount in values.items():
-                pipe.hincrby(f"proxy:ts:latency_sum:{bucket}", service, amount)
-        for bucket, values in ts_latency_count.items():
-            for service, count in values.items():
-                pipe.hincrby(f"proxy:ts:latency_count:{bucket}", service, count)
-        for bucket, values in ts_errors.items():
-            for service, count in values.items():
-                pipe.hincrby(f"proxy:ts:errors:{bucket}", service, count)
-        for failure_reason, count in failures.items():
-            pipe.hincrby(_PROXY_METRIC_FAILURES, failure_reason, count)
-        await pipe.execute()
+        await self._metrics.flush_to(self._redis)
 
     async def _record_traffic_activity(
         self,
