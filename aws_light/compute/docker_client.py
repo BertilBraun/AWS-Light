@@ -55,6 +55,13 @@ class DockerClient:
         try:
             network = self._client.networks.get(network_name)
             container: Container = self._client.containers.get(container_id)
+            container.reload()
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            attached_network = networks.get(network_name)
+            if attached_network is not None:
+                existing_aliases = set(attached_network.get("Aliases") or [])
+                if not aliases or set(aliases).issubset(existing_aliases):
+                    return
             network.connect(container, aliases=aliases)
         except docker.errors.APIError as error:
             if "already exists" not in str(error).lower():

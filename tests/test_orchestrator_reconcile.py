@@ -44,6 +44,7 @@ class FakeDockerClient:
         self.network_connections: list[tuple[str, str]] = []
         self.network_connection_aliases: list[tuple[str, str, tuple[str, ...]]] = []
         self.compose_containers: list[ComposeContainerInfo] = []
+        self.list_compose_calls = 0
 
     def ensure_network(self, network_name: str) -> None:
         self.ensured_networks.append(network_name)
@@ -101,6 +102,7 @@ class FakeDockerClient:
     def list_compose_containers(
         self, project_name: str = "aws-light"
     ) -> list[ComposeContainerInfo]:
+        self.list_compose_calls += 1
         return self.compose_containers
 
     def list_containers_by_label(
@@ -964,6 +966,61 @@ async def test_proxy_and_health_checker_join_service_network(tmp_path: Path) -> 
         ("health-checker",),
     ) in docker_client.network_connection_aliases
     assert ("autoscaler-container", "aws-light-svc-api") not in docker_client.network_connections
+
+
+async def test_reconcile_all_lists_compose_containers_once_for_service_networks(
+    tmp_path: Path,
+) -> None:
+    service_store: JsonStore[ServiceState] = JsonStore(tmp_path / "services.json", ServiceState)
+    deployment_store: JsonStore[RolloutState] = JsonStore(
+        tmp_path / "deployments.json", RolloutState
+    )
+    event_bus = FakeEventBus()
+    node_manager = NodeManager()
+    node_manager.initialize()
+    docker_client = FakeDockerClient(running_containers=set())
+    docker_client.compose_containers = [
+        ComposeContainerInfo(
+            service="proxy",
+            container_id="proxy-container",
+            name="aws-light-proxy-1",
+            image="aws-light-proxy",
+            status="running",
+            health="",
+            ports=[],
+        ),
+    ]
+    for service_name in ("api", "worker"):
+        await service_store.put(
+            service_name,
+            ServiceState(
+                spec=ServiceSpec(
+                    name=service_name,
+                    image=f"example/{service_name}:latest",
+                    replicas=0,
+                    cpu_request=0.2,
+                    memory_request_mb=128,
+                    port=8000,
+                ),
+                status=ResourceStatus.PENDING,
+                replicas=[],
+            ),
+        )
+
+    orchestrator = ComputeOrchestrator(
+        service_store=service_store,
+        deployment_store=deployment_store,
+        docker_client=docker_client,  # type: ignore[arg-type]
+        node_manager=node_manager,
+        scheduler=BinPackScheduler(),
+        event_bus=event_bus,  # type: ignore[arg-type]
+        routing_table=RoutingTable(),
+        secrets_manager=FakeSecretsManager(),  # type: ignore[arg-type]
+    )
+
+    await orchestrator._reconcile_all()
+
+    assert docker_client.list_compose_calls == 1
 
 
 async def test_teardown_service_removes_service_network(tmp_path: Path) -> None:

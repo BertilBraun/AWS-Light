@@ -6,7 +6,7 @@ import secrets
 import uuid
 from datetime import datetime
 
-from aws_light.compute.docker_client import DockerClient
+from aws_light.compute.docker_client import ComposeContainerInfo, DockerClient
 from aws_light.compute.node_manager import NodeManager
 from aws_light.compute.scheduler import Scheduler, SchedulingError
 from aws_light.config import settings
@@ -128,11 +128,12 @@ class ComputeOrchestrator:
             for database_state in await self._database_store.list():
                 await self._reconcile_database(database_state)
         all_services = await self._service_store.list()
+        platform_containers = self._platform_compose_containers()
         for service_state in all_services:
             if service_state.status == ResourceStatus.DELETING:
                 await self._teardown_service(service_state)
             else:
-                await self._reconcile_service(service_state)
+                await self._reconcile_service(service_state, platform_containers)
         if self._node_store is not None:
             await self._sync_nodes_to_store()
 
@@ -235,14 +236,26 @@ class ComputeOrchestrator:
         for node_state in self._node_manager.get_all_nodes():
             await self._node_store.put(node_state.spec.node_id, node_state)  # type: ignore[union-attr]
 
-    def _ensure_service_network(self, service_name: str) -> str:
+    def _platform_compose_containers(self) -> list[ComposeContainerInfo]:
+        return [
+            container
+            for container in self._docker_client.list_compose_containers()
+            if container.service in _SERVICE_NETWORK_PLATFORM_SERVICES
+        ]
+
+    def _ensure_service_network(
+        self,
+        service_name: str,
+        platform_containers: list[ComposeContainerInfo] | None = None,
+    ) -> str:
         network_name = _service_network_name(service_name)
         self._docker_client.ensure_network(network_name)
-        for container in self._docker_client.list_compose_containers():
-            if container.service in _SERVICE_NETWORK_PLATFORM_SERVICES:
-                self._docker_client.connect_container_to_network(
-                    container.container_id, network_name, aliases=[container.service]
-                )
+        if platform_containers is None:
+            platform_containers = self._platform_compose_containers()
+        for container in platform_containers:
+            self._docker_client.connect_container_to_network(
+                container.container_id, network_name, aliases=[container.service]
+            )
         return network_name
 
     async def _teardown_service(self, service_state: ServiceState) -> None:
@@ -253,9 +266,13 @@ class ComputeOrchestrator:
         self._docker_client.remove_network(_service_network_name(service_state.spec.name))
         logger.info("Tore down deleted service %s", service_state.spec.name)
 
-    async def _reconcile_service(self, service_state: ServiceState) -> None:
+    async def _reconcile_service(
+        self,
+        service_state: ServiceState,
+        platform_containers: list[ComposeContainerInfo] | None = None,
+    ) -> None:
         spec = service_state.spec
-        self._ensure_service_network(spec.name)
+        self._ensure_service_network(spec.name, platform_containers)
         service_state = await self._refresh_observed_replicas(service_state)
         running_replicas = [
             replica

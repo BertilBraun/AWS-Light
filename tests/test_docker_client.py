@@ -37,6 +37,61 @@ class _FakeStatsContainer:
         }
 
 
+class _FakeNetwork:
+    def __init__(self) -> None:
+        self.connected: list[tuple[object, list[str] | None]] = []
+        self.disconnected: list[object] = []
+
+    def connect(self, container: object, aliases: list[str] | None = None) -> None:
+        self.connected.append((container, aliases))
+
+    def disconnect(self, container: object) -> None:
+        self.disconnected.append(container)
+
+
+class _FakeNetworks:
+    def __init__(self, network: _FakeNetwork) -> None:
+        self._network = network
+
+    def get(self, network_name: str) -> _FakeNetwork:
+        assert network_name == "svc-network"
+        return self._network
+
+
+class _FakeContainerLookup:
+    def __init__(self, container: _FakeAttachedContainer) -> None:
+        self._container = container
+
+    def get(self, container_id: str) -> _FakeAttachedContainer:
+        assert container_id == "container-1"
+        return self._container
+
+
+class _FakeAttachedContainer:
+    id = "container-1"
+
+    def __init__(self) -> None:
+        self.reloads = 0
+        self.attrs = {
+            "NetworkSettings": {
+                "Networks": {
+                    "svc-network": {
+                        "Aliases": ["container-1", "proxy"],
+                    }
+                }
+            }
+        }
+
+    def reload(self) -> None:
+        self.reloads += 1
+
+
+class _FakeNetworkDockerSdkClient:
+    def __init__(self, container: _FakeAttachedContainer, network: _FakeNetwork) -> None:
+        self.containers = _FakeContainerLookup(container)
+        self.networks = _FakeNetworks(network)
+
+
 def test_format_volume_bindings_expands_mount_paths_for_docker_sdk() -> None:
     assert _format_volume_bindings(
         {"aws-light-db-app-db-data": "/var/lib/postgresql/data"}
@@ -62,3 +117,16 @@ def test_get_container_stats_uses_one_shot_docker_stats() -> None:
     assert stats is not None
     assert stats.memory_mb == 1
     assert container.stats_kwargs == {"stream": False, "one_shot": True}
+
+
+def test_connect_container_to_network_skips_existing_alias() -> None:
+    container = _FakeAttachedContainer()
+    network = _FakeNetwork()
+    client = object.__new__(DockerClient)
+    client._client = _FakeNetworkDockerSdkClient(container, network)  # type: ignore[attr-defined]
+
+    client.connect_container_to_network("container-1", "svc-network", aliases=["proxy"])
+
+    assert container.reloads == 1
+    assert network.connected == []
+    assert network.disconnected == []
