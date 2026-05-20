@@ -17,3 +17,18 @@ def test_compose_does_not_require_legacy_shared_workload_network() -> None:
     assert "data" not in compose["networks"]
     assert compose["services"]["proxy"]["networks"] == ["internal"]
     assert compose["services"]["health-checker"]["networks"] == ["internal"]
+
+
+def test_core_compose_services_restart_unless_stopped() -> None:
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+
+    for service_name in (
+        "postgres",
+        "redis",
+        "control-plane",
+        "orchestrator",
+        "proxy",
+        "health-checker",
+        "autoscaler",
+    ):
+        assert compose["services"][service_name]["restart"] == "unless-stopped"

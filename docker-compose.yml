@@ -10,6 +10,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     networks: [internal]
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -25,6 +26,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     networks: [internal]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -36,6 +38,7 @@ services:
     build:
       context: .
       dockerfile: services/control-plane/Dockerfile
+    restart: unless-stopped
     networks: [internal]
     ports: ["8000:8000"]
     volumes:
@@ -55,6 +58,7 @@ services:
     build:
       context: .
       dockerfile: services/orchestrator/Dockerfile
+    restart: unless-stopped
     networks: [internal]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -73,6 +77,7 @@ services:
     build:
       context: .
       dockerfile: services/proxy/Dockerfile
+    restart: unless-stopped
     networks: [internal]
     ports: ["8080:8080"]
     env_file: .env
@@ -84,6 +89,7 @@ services:
     build:
       context: .
       dockerfile: services/health-checker/Dockerfile
+    restart: unless-stopped
     networks: [internal]
     env_file: .env
     depends_on:
@@ -96,6 +102,7 @@ services:
     build:
       context: .
       dockerfile: services/autoscaler/Dockerfile
+    restart: unless-stopped
     networks: [internal]
     env_file: .env
     depends_on:
