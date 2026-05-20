@@ -151,7 +151,7 @@ class DockerClient:
     def get_container_stats(self, container_id: str) -> ContainerStats | None:
         try:
             container: Container = self._client.containers.get(container_id)
-            raw_stats = cast(dict[str, Any], container.stats(stream=False))
+            raw_stats = cast(dict[str, Any], container.stats(stream=False, one_shot=True))
             cpu_percent = _calculate_cpu_percent(raw_stats)
             memory_bytes = raw_stats["memory_stats"].get("usage", 0)
             memory_mb = memory_bytes / (1024 * 1024)
