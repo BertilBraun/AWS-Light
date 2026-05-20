@@ -148,3 +148,66 @@ The repository includes `scripts/load_test_proxy.py` for proxy load testing.
 Local numbers vary heavily by machine, Docker backend, service behavior, and
 concurrency. Treat the script as a comparative tool for changes, not a benchmark
 claim.
+
+Before testing, deploy a simple service that returns quickly. `secret-service`
+or `echo-service` are good proxy targets; `combined-service` includes storage,
+database, and downstream calls, so it measures the whole demo workflow rather
+than the proxy hot path.
+
+Example setup:
+
+```powershell
+docker build -t aws-light/secret-service:latest examples/secret-service
+aws-light apply examples/secret-service.yaml
+```
+
+Run the bundled load test:
+
+```powershell
+python scripts/load_test_proxy.py `
+  --url http://localhost:8080/ `
+  --host secret-service.localhost `
+  --requests 5000 `
+  --concurrency 200 `
+  --timeout 30
+```
+
+The script prints total requests, successful 2xx responses, elapsed time, RPS,
+and a count of response statuses or client-side exceptions.
+
+For the combined demo, include the token in the URL and use the combined host:
+
+```powershell
+python scripts/load_test_proxy.py `
+  --url "http://localhost:8080/?demo_token=demo-token" `
+  --host combined-service.localhost `
+  --requests 500 `
+  --concurrency 50 `
+  --timeout 60
+```
+
+This is expected to be much slower because each request exercises storage,
+Postgres, CPU service calls, and flaky-service calls.
+
+If using an external tool such as `bombardier`, keep the same host-header model:
+
+```powershell
+.\bombardier.exe -c 200 -n 5000 -H "Host: secret-service.localhost" http://localhost:8080/
+```
+
+During a run, watch the dashboard or platform metrics:
+
+- proxy request and response counts,
+- `rps:<service>` values used by the autoscaler,
+- health-check status,
+- autoscaler events,
+- topology observed-traffic edges.
+
+For useful comparisons, keep the test target, request count, concurrency, Docker
+state, and machine load the same between runs. Rebuild and recreate the proxy
+after proxy code changes:
+
+```powershell
+docker compose build --no-cache proxy
+docker compose up -d --no-deps --force-recreate proxy
+```
