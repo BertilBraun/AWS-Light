@@ -24,6 +24,7 @@ from aws_light.proxy.proxy_server import (
     _has_transfer_encoding,
     _read_full_response,
     _read_http_head,
+    _request_connection_should_close,
     _rewrite_request_headers,
     _rewrite_response_headers,
 )
@@ -158,6 +159,19 @@ class FakeWriter:
 
     async def drain(self) -> None:
         return None
+
+
+class CloseAwareFakeWriter(FakeWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+        self.waited_closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        self.waited_closed = True
 
 
 class FakeUpstreamWriter(FakeWriter):
@@ -405,6 +419,48 @@ async def test_proxy_forwards_http_with_injected_upstream_client() -> None:
     ]
 
 
+async def test_proxy_handles_multiple_http_requests_on_one_client_connection() -> None:
+    service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
+    upstream_client = FakeUpstreamHttpClient(
+        [
+            httpx.Response(200, headers={"Content-Length": "3"}, stream=httpx.ByteStream(b"one")),
+            httpx.Response(200, headers={"Content-Length": "3"}, stream=httpx.ByteStream(b"two")),
+        ]
+    )
+    proxy = ProxyServer(
+        balancer=StaticBalancer(
+            [ReplicaEndpoint("replica-1", "10.0.0.5", 9000, healthy=True)]
+        ),  # type: ignore[arg-type]
+        port=8080,
+        service_store=service_store,  # type: ignore[arg-type]
+        upstream_http_client=upstream_client,  # type: ignore[arg-type]
+    )
+    writer = CloseAwareFakeWriter()
+
+    await proxy._handle_connection(
+        _reader_with(
+            b"GET /one HTTP/1.1\r\n"
+            b"Host: public-api.localhost\r\n"
+            b"\r\n"
+            b"GET /two HTTP/1.1\r\n"
+            b"Host: public-api.localhost\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+        ),
+        writer,  # type: ignore[arg-type]
+    )
+
+    assert writer.data.count(b"HTTP/1.1 200 OK\r\n") == 2
+    assert b"\r\nConnection: keep-alive\r\n\r\none" in writer.data
+    assert writer.data.endswith(b"\r\nConnection: close\r\n\r\ntwo")
+    assert [request["url"] for request in upstream_client.requests] == [
+        "http://10.0.0.5:9000/one",
+        "http://10.0.0.5:9000/two",
+    ]
+    assert writer.closed
+    assert writer.waited_closed
+
+
 async def test_proxy_falls_back_to_next_http_replica_before_response_starts() -> None:
     service_store = FakeServiceStore({"public-api": _service_state("public-api", external=True)})
     upstream_client = FakeUpstreamHttpClient(
@@ -546,6 +602,17 @@ def test_request_content_length_parsing() -> None:
     bad_content_length = b"POST / HTTP/1.1\r\nContent-Length: bad\r\n\r\n"
     assert _extract_request_content_length(bad_content_length) is None
     assert _has_transfer_encoding(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+
+
+def test_request_connection_close_parsing() -> None:
+    assert not _request_connection_should_close(b"GET / HTTP/1.1\r\nHost: svc\r\n\r\n")
+    assert _request_connection_should_close(
+        b"GET / HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n"
+    )
+    assert _request_connection_should_close(b"GET / HTTP/1.0\r\nHost: svc\r\n\r\n")
+    assert not _request_connection_should_close(
+        b"GET / HTTP/1.0\r\nHost: svc\r\nConnection: keep-alive\r\n\r\n"
+    )
 
 
 def test_extract_response_status() -> None:
